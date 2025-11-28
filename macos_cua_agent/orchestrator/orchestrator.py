@@ -180,6 +180,9 @@ class Orchestrator:
                     # UI changed; allow future hotkeys to be considered fresh.
                     hotkey_counts.clear()
 
+                # Signature used for repeat detection and hinting; set early so failure handling can reference it.
+                action_sig = repr(action)
+
                 if plan and current_step:
                     step_completed = False
                     reflection_result = None
@@ -229,7 +232,6 @@ class Orchestrator:
                             self.logger.info("Plan completed; stopping loop.")
                             break
 
-                action_sig = repr(action)
                 is_wait = action.get("type") == "wait"
                 pending_break = False
                 break_reason = ""
