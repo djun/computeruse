@@ -182,12 +182,30 @@ class Orchestrator:
 
                 if plan and current_step:
                     step_completed = False
+                    reflection_result = None
                     if self.reflector.available:
-                        step_completed = self.reflector.is_step_complete(
+                        reflection_result = self.reflector.evaluate_step(
                             current_step, state.history, next_frame, changed
                         )
+                        step_completed = reflection_result.is_complete
                     elif not self.settings.strict_step_completion:
                         step_completed = self._heuristic_step_complete(current_step, action, result, changed)
+                    
+                    if reflection_result and reflection_result.status == "failed":
+                        self.logger.warning("Step %s failed verification: %s (%s)", current_step.id, reflection_result.reason, reflection_result.failure_type)
+                        state.history.append(f"reflector_fail:{reflection_result.failure_type}:{reflection_result.reason}")
+                        
+                        # Contingency: If we have recovery steps, suggest them to the agent via history
+                        if current_step.recovery_steps:
+                            recovery_msg = f"recovery_suggestion: Step failed. Try: {', '.join(current_step.recovery_steps)}"
+                            state.history.append(recovery_msg)
+                            self.logger.info(recovery_msg)
+                            repeat_info_for_model = {
+                                "count": repeat_same_action, 
+                                "action": action_sig,
+                                "hint": f"Verification failed. Try: {', '.join(current_step.recovery_steps)}"
+                            }
+
                     if step_completed:
                         finished_id = current_step.id if current_step else None
                         

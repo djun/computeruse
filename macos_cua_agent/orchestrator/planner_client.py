@@ -49,15 +49,16 @@ class PlannerClient:
         system_prompt = (
             "You are a task planner for a macOS desktop agent. "
             "Write a concise JSON object with an ordered `steps` array. "
-            "Each step must have fields: id (int), description (string), success_criteria (string), status (pending|in_progress|done|failed), notes (string), expected_state (string).\n"
+            "Each step must have fields: id (int), description (string), success_criteria (string), status (pending|in_progress|done|failed), notes (string), expected_state (string), recovery_steps (array of strings).\n"
             "- Split the task into 3-7 small UI-manipulation steps that can usually be finished in 10-60 seconds.\n"
             "- Apply SMART goal principles (Specific, Measurable, Achievable, Relevant, Time-bound) to each step.\n"
             "- 'description' must be Specific and Action-oriented (e.g., 'Click the Search icon', not 'Find file').\n"
             "- 'success_criteria' must be Measurable and VISUAL (e.g., 'Search bar appears', not 'Search is ready').\n"
+            "- 'recovery_steps' should list 1-2 alternative actions if the primary method fails (e.g., 'Use Cmd+F instead of menu').\n"
             "- Mark the first step status as 'in_progress'; others should start as 'pending'.\n"
             "- expected_state is optional; use it to note the anticipated UI state before running the step.\n"
             "Example step:\n"
-            "{ \"id\": 0, \"description\": \"Open Safari\", \"success_criteria\": \"Safari window is visible\", \"status\": \"in_progress\", \"notes\": \"\", \"expected_state\": \"Dock shows Safari not active\" }\n"
+            "{ \"id\": 0, \"description\": \"Open Safari\", \"success_criteria\": \"Safari window is visible\", \"status\": \"in_progress\", \"notes\": \"\", \"expected_state\": \"Dock shows Safari not active\", \"recovery_steps\": [\"Click Finder > Applications > Safari\"] }\n"
             "Do not include any text outside the JSON."
         )
         user_prompt_block = f"User request: {user_prompt}\n\nPrior context:\n{context}"
@@ -92,10 +93,11 @@ class PlannerClient:
             "You are revising an in-flight macOS desktop plan. Given the existing plan JSON, "
             "recent events, and a screenshot, return an UPDATED plan JSON. Keep the same schema "
             "as the planner output: id, user_prompt, steps (with id, description, success_criteria, "
-            "status, notes, expected_state), current_step_index.\n"
+            "status, notes, expected_state, recovery_steps), current_step_index.\n"
             "- Keep 3-7 concise, UI-grounded steps that a human could finish in 10-60 seconds each.\n"
             "- Ensure steps follow SMART principles (Specific, Measurable, Achievable, Relevant, Time-bound).\n"
             "- 'success_criteria' must be VISUAL and Measurable.\n"
+            "- 'recovery_steps' should list 1-2 alternative actions if the step fails.\n"
             "- Mark steps as done if their success_criteria are visibly satisfied in the screenshot.\n"
             "- Mark obviously blocked steps as failed with a short note; add missing steps if needed.\n"
             "- Ensure exactly one step is 'in_progress' (the first not-done step). Others pending or done.\n"
@@ -152,6 +154,7 @@ class PlannerClient:
                     status=str(raw.get("status", "pending")),
                     notes=str(raw.get("notes", "")),
                     expected_state=str(raw.get("expected_state", "")),
+                    recovery_steps=raw.get("recovery_steps", []),
                 )
                 steps.append(step)
             except Exception:

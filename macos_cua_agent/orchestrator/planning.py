@@ -12,6 +12,7 @@ class Step:
     status: str = "pending"  # pending|in_progress|done|failed
     notes: str = ""
     expected_state: str = ""
+    recovery_steps: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
