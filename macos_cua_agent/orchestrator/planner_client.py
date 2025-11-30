@@ -36,6 +36,7 @@ class PlannerClient:
         user_prompt: str,
         prior_episodes: List[Episode] | None = None,
         prior_semantic: List[SemanticMemoryItem] | None = None,
+        screenshot_b64: str | None = None,
     ) -> Plan:
         plan_id = str(uuid.uuid4())
         if not self.client:
@@ -46,33 +47,42 @@ class PlannerClient:
             return Plan(id=plan_id, user_prompt=user_prompt, steps=steps, current_step_index=0)
 
         context = self._format_memory_context(prior_episodes or [], prior_semantic or [])
+        mime = "image/png" if self.settings.encode_format.lower() == "png" else "image/jpeg"
+        
         system_prompt = (
             "You are a task planner for a macOS desktop agent. "
-            "Write a concise JSON object with an ordered `steps` array. "
-            "Each step must have fields: id (int), description (string), success_criteria (string), status (pending|in_progress|done|failed), notes (string), expected_state (string), recovery_steps (array of strings).\n"
-            "- Split the task into 3-7 small UI-manipulation steps that can usually be finished in 10-60 seconds.\n"
-            "- Apply SMART goal principles (Specific, Measurable, Achievable, Relevant, Time-bound) to each step.\n"
-            "- 'description' must be Specific and Action-oriented (e.g., 'Click the Search icon', not 'Find file').\n"
-            "- 'success_criteria' must be Measurable and VISUAL (e.g., 'Search bar appears', not 'Search is ready').\n"
-            "- 'recovery_steps' should list 1-2 alternative actions if the primary method fails (e.g., 'Use Cmd+F instead of menu').\n"
-            "- Mark the first step status as 'in_progress'; others should start as 'pending'.\n"
-            "- expected_state is optional; use it to note the anticipated UI state before running the step.\n"
-            "Example step:\n"
-            "{ \"id\": 0, \"description\": \"Open Safari\", \"success_criteria\": \"Safari window is visible\", \"status\": \"in_progress\", \"notes\": \"\", \"expected_state\": \"Dock shows Safari not active\", \"recovery_steps\": [\"Click Finder > Applications > Safari\"] }\n"
-            "Do not include any text outside the JSON."
+            "First, THINK step-by-step about the user request, the current screen state, and potential obstacles. "
+            "Then, output a JSON object with an ordered `steps` array.\n"
+            "Each step must have: id (int), description (string), success_criteria (string), status (pending|in_progress|done|failed), notes (string), expected_state (string), recovery_steps (array of strings), sub_steps (array of strings).\n"
+            "- Split the task into 3-7 small, verifiable steps.\n"
+            "- Apply SMART goal principles.\n"
+            "- 'sub_steps': Break complex steps into atomic actions (e.g. 'Click File', 'Select Print').\n"
+            "- 'description': Specific and Action-oriented.\n"
+            "- 'success_criteria': Measurable and VISUAL.\n"
+            "- Mark the first step status as 'in_progress'.\n"
+            "Output format: \n"
+            "REASONING: <your thought process>\n"
+            "PLAN_JSON: <the valid JSON object>"
         )
-        user_prompt_block = f"User request: {user_prompt}\n\nPrior context:\n{context}"
+        
+        user_content = [
+            {"type": "text", "text": f"User request: {user_prompt}\n\nPrior context:\n{context}"},
+        ]
+        if screenshot_b64:
+            user_content.append(
+                {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{screenshot_b64}"}}
+            )
+
         try:
             response = self.client.chat.completions.create(
                 model=self.settings.planner_model,
                 messages=[
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt_block},
+                    {"role": "user", "content": user_content},
                 ],
-                response_format={"type": "json_object"},
             )
             content = response.choices[0].message.content if response and response.choices else "{}"
-            plan_dict = self._parse_plan_json(content, plan_id, user_prompt)
+            plan_dict = self._parse_plan_response(content, plan_id, user_prompt)
             return Plan.from_dict(plan_dict)
         except Exception as exc:  # pragma: no cover - defensive path
             self.logger.warning("Planner call failed; using fallback plan: %s", exc)
@@ -90,19 +100,18 @@ class PlannerClient:
 
         mime = "image/png" if self.settings.encode_format.lower() == "png" else "image/jpeg"
         system_prompt = (
-            "You are revising an in-flight macOS desktop plan. Given the existing plan JSON, "
-            "recent events, and a screenshot, return an UPDATED plan JSON. Keep the same schema "
-            "as the planner output: id, user_prompt, steps (with id, description, success_criteria, "
-            "status, notes, expected_state, recovery_steps), current_step_index.\n"
-            "- Keep 3-7 concise, UI-grounded steps that a human could finish in 10-60 seconds each.\n"
-            "- Ensure steps follow SMART principles (Specific, Measurable, Achievable, Relevant, Time-bound).\n"
-            "- 'success_criteria' must be VISUAL and Measurable.\n"
-            "- 'recovery_steps' should list 1-2 alternative actions if the step fails.\n"
-            "- Mark steps as done if their success_criteria are visibly satisfied in the screenshot.\n"
-            "- Mark obviously blocked steps as failed with a short note; add missing steps if needed.\n"
-            "- Ensure exactly one step is 'in_progress' (the first not-done step). Others pending or done.\n"
-            "- Do not invent unrelated tasks; align strictly with the user_prompt.\n"
-            "Return JSON only."
+            "You are revising an in-flight macOS desktop plan. "
+            "First, REASON about the failure or current state. "
+            "Then, output an UPDATED plan JSON.\n"
+            "Schema: id, user_prompt, steps (id, description, success_criteria, status, notes, expected_state, recovery_steps, sub_steps), current_step_index.\n"
+            "- Keep 3-7 concise steps.\n"
+            "- 'success_criteria' must be VISUAL.\n"
+            "- Mark steps as done if satisfied.\n"
+            "- Mark blocked steps as failed.\n"
+            "- Ensure exactly one step is 'in_progress'.\n"
+            "Output format: \n"
+            "REASONING: <text>\n"
+            "PLAN_JSON: <json>"
         )
         plan_json = json.dumps(plan.to_dict())
         user_content = [
@@ -123,23 +132,36 @@ class PlannerClient:
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_content},
                 ],
-                response_format={"type": "json_object"},
             )
             content = response.choices[0].message.content if response and response.choices else "{}"
-            plan_dict = self._parse_plan_json(content, plan.id, plan.user_prompt)
+            plan_dict = self._parse_plan_response(content, plan.id, plan.user_prompt)
             return Plan.from_dict(plan_dict)
         except Exception as exc:  # pragma: no cover - defensive path
             self.logger.warning("Plan revision failed; keeping existing plan: %s", exc)
             return plan
 
-    def _parse_plan_json(self, content: Any, plan_id: str, user_prompt: str) -> Dict[str, Any]:
+    def _parse_plan_response(self, content: Any, plan_id: str, user_prompt: str) -> Dict[str, Any]:
         if isinstance(content, list):
             content = "".join([frag.text for frag in content if hasattr(frag, "text")])  # type: ignore
         if not isinstance(content, str):
             content = json.dumps(content or {})
+        
+        json_str = content
+        if "PLAN_JSON:" in content:
+            parts = content.split("PLAN_JSON:", 1)
+            if len(parts) > 1:
+                json_str = parts[1].strip()
+        else:
+            # Fallback: try to find the first brace
+            start = content.find("{")
+            end = content.rfind("}")
+            if start != -1 and end != -1:
+                json_str = content[start : end + 1]
+
         try:
-            data = json.loads(content)
+            data = json.loads(json_str)
         except Exception:
+            self.logger.warning("Failed to parse plan JSON from content: %s", content[:200])
             data = {}
 
         raw_steps = data.get("steps") or []
@@ -155,6 +177,7 @@ class PlannerClient:
                     notes=str(raw.get("notes", "")),
                     expected_state=str(raw.get("expected_state", "")),
                     recovery_steps=raw.get("recovery_steps", []),
+                    sub_steps=raw.get("sub_steps", []),
                 )
                 steps.append(step)
             except Exception:

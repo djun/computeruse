@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import shlex
+import shutil
 from dataclasses import dataclass
 from typing import Any, Dict, List
 
@@ -11,8 +13,9 @@ DEFAULT_RULES = {
     "blocked_actions": ["shell_command"],
     "blocked_bundle_ids": ["com.apple.keychainaccess"],
     "hitl_actions": ["erase_disk", "format_disk"],
-    "allowed_shell_basenames": [],
-    "blocked_shell_basenames": [],
+    "allowed_shell_basenames": [], # Deprecated but kept for compatibility
+    "blocked_shell_basenames": [], # Deprecated
+    "exclusion_zones": [], # List of {x, y, w, h, label}
 }
 
 
@@ -25,6 +28,15 @@ class PolicyDecision:
 
 class PolicyEngine:
     """Evaluates proposed actions against configured safety rules."""
+    
+    # Secure Allowlist: Absolute Path -> Allowed Args (or "*" for all)
+    ALLOWED_COMMANDS = {
+        "/bin/ls": ["*"],
+        "/bin/echo": ["*"],
+        "/usr/bin/grep": ["*"],
+        "/usr/bin/wc": ["*"],
+        "/usr/bin/git": ["status", "log", "diff", "show", "checkout", "branch"],
+    }
 
     def __init__(self, rules_path: str, settings: Settings | None = None) -> None:
         self.logger = get_logger(__name__)
@@ -64,21 +76,62 @@ class PolicyEngine:
 
         if action_type in self.rules.get("blocked_actions", []):
             return PolicyDecision(allowed=False, reason=f"action blocked: {action_type}")
+            
+        # Spatial Exclusion Check
+        x = action.get("x")
+        y = action.get("y")
+        tx = action.get("target_x")
+        ty = action.get("target_y")
+        
+        zones = self.rules.get("exclusion_zones", [])
+        for zone in zones:
+            zx, zy, zw, zh = zone.get("x", 0), zone.get("y", 0), zone.get("w", 0), zone.get("h", 0)
+            label = zone.get("label", "restricted area")
+            
+            # Check source point
+            if x is not None and y is not None:
+                if zx <= x <= zx + zw and zy <= y <= zy + zh:
+                    return PolicyDecision(False, f"interaction in exclusion zone: {label}")
+            
+            # Check target point (drag)
+            if tx is not None and ty is not None:
+                if zx <= tx <= zx + zw and zy <= ty <= zy + zh:
+                    return PolicyDecision(False, f"interaction target in exclusion zone: {label}")
+
         if action_type == "sandbox_shell":
             cmd_raw = action.get("cmd") or action.get("command") or ""
-            basename = ""
+            argv = []
             if isinstance(cmd_raw, str):
-                parts = cmd_raw.strip().split()
-                basename = parts[0] if parts else ""
+                try:
+                    argv = shlex.split(cmd_raw)
+                except ValueError:
+                    return PolicyDecision(False, "malformed command string")
             elif isinstance(cmd_raw, (list, tuple)):
-                basename = str(cmd_raw[0]) if cmd_raw else ""
+                argv = list(cmd_raw)
+            
+            if not argv:
+                return PolicyDecision(False, "empty command")
 
-            if basename in self.rules.get("blocked_shell_basenames", []):
-                return PolicyDecision(allowed=False, reason=f"shell command blocked: {basename}")
+            # 1. Resolve Executable Path
+            cmd_name = argv[0]
+            resolved_path = shutil.which(cmd_name)
+            
+            if not resolved_path:
+                return PolicyDecision(False, f"command not found: {cmd_name}")
 
-            allowed = self.rules.get("allowed_shell_basenames")
-            if allowed and basename not in allowed:
-                return PolicyDecision(allowed=False, reason=f"shell command not allowlisted: {basename}")
+            # 2. Strict Allowlist Check
+            if resolved_path not in self.ALLOWED_COMMANDS:
+                return PolicyDecision(False, f"command path not allowlisted: {resolved_path}")
+
+            # 3. Argument Validation (Basic)
+            allowed_args = self.ALLOWED_COMMANDS.get(resolved_path, [])
+            if "*" not in allowed_args:
+                # If first arg looks like a subcommand, check it
+                if len(argv) > 1:
+                    subcommand = argv[1]
+                    if not subcommand.startswith("-") and subcommand not in allowed_args:
+                         return PolicyDecision(False, f"subcommand not allowed: {subcommand}")
+        
         if bundle_id and bundle_id in self.rules.get("blocked_bundle_ids", []):
             return PolicyDecision(allowed=False, reason=f"bundle blocked: {bundle_id}")
         if action_type in self.rules.get("hitl_actions", []):

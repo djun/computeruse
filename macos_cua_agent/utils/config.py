@@ -35,6 +35,8 @@ class Settings:
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
     encode_format: str = os.getenv("ENCODE_FORMAT", "JPEG")
     verify_delay_ms: int = int(os.getenv("VERIFY_DELAY_MS", "200"))
+    settle_delay_ms: int = int(os.getenv("SETTLE_DELAY_MS", "500"))
+    ssim_change_threshold: float = float(os.getenv("SSIM_CHANGE_THRESHOLD", "0.985"))
     max_steps: int = int(os.getenv("MAX_STEPS", "50"))
     max_failures: int = int(os.getenv("MAX_FAILURES", "5"))
     max_wall_clock_seconds: int | None = (
@@ -42,7 +44,7 @@ class Settings:
     )
 
     enable_hid: bool = _get_bool("ENABLE_HID", False)
-    enable_semantic: bool = _get_bool("ENABLE_SEMANTIC", False)
+    enable_semantic: bool = _get_bool("ENABLE_SEMANTIC", True)
     enable_shell: bool = _get_bool("ENABLE_SHELL", False)
     use_openrouter: bool = _get_bool("USE_OPENROUTER", True)
     planner_use_openrouter: bool = use_openrouter

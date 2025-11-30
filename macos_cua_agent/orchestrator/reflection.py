@@ -59,7 +59,7 @@ class Reflector:
             "Respond in JSON format with:\n"
             "- is_complete (bool): true if strictly satisfied.\n"
             "- status (str): 'success', 'incomplete', or 'failed' (if clearly blocked or erroneous).\n"
-            "- failure_type (str): 'visual_mismatch', 'blocked_by_popup', 'no_change', 'error_message', or empty if success.\n"
+            "- failure_type (str): REQUIRED if failed. Values: 'visual_mismatch', 'blocked_by_popup', 'no_change', 'error_message', 'wrong_app'. Empty if success.\n"
             "- reason (str): concise explanation."
         ).format(desc=step.description, criteria=step.success_criteria, expected_text=expected_text)
 

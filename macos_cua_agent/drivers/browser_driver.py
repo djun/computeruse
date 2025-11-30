@@ -49,16 +49,37 @@ class BrowserDriver:
     def _navigate(self, app_name: str, url: Optional[str]) -> ActionResult:
         if not url:
             return ActionResult(success=False, reason="url required")
-        
-        js = f"window.location.href = '{url}'"
-        return self._run_js(app_name, js, "navigate")
 
-    def _run_js(self, app_name: str, js_code: str, label: str) -> ActionResult:
-        script = self._build_applescript(app_name, js_code)
+        # Secure navigation using parameterized AppleScript (avoids injection)
+        if "Safari" in app_name:
+            script = """
+            on run argv
+                set targetUrl to item 1 of argv
+                tell application "Safari"
+                    if (count of documents) = 0 then make new document
+                    set URL of front document to targetUrl
+                end tell
+            end run
+            """
+        else:
+            # Chrome/Brave/Edge/etc
+            script = f"""
+            on run argv
+                set targetUrl to item 1 of argv
+                tell application "{app_name}"
+                    if (count of windows) = 0 then make new window
+                    set URL of active tab of front window to targetUrl
+                end tell
+            end run
+            """
+        return self._run_arg_applescript(app_name, script, [url], "navigate")
+
+    def _run_arg_applescript(self, app_name: str, script: str, args: list[str], label: str) -> ActionResult:
         try:
-            # self.logger.debug("Running AppleScript for %s: %s", label, script)
+            # self.logger.debug("Running Arg AppleScript for %s", label)
+            cmd = ["osascript", "-e", script] + args
             result = subprocess.run(
-                ["osascript", "-e", script],
+                cmd,
                 capture_output=True,
                 text=True,
                 check=False
@@ -76,26 +97,36 @@ class BrowserDriver:
         except Exception as e:
             return ActionResult(success=False, reason=f"{label} exception: {str(e)}")
 
-    def _build_applescript(self, app_name: str, js_code: str) -> str:
-        # Escape double quotes and backslashes for AppleScript string
-        safe_js = js_code.replace("\\", "\\\\").replace('"', '\\"')
-        
+    def _run_js(self, app_name: str, js_code: str, label: str) -> ActionResult:
+        script = self._build_applescript(app_name)
+        return self._run_arg_applescript(app_name, script, [js_code], label)
+
+    def _build_applescript(self, app_name: str) -> str:
         if "Chrome" in app_name:
-            return f'''
-            tell application "{app_name}"
-                execute front window's active tab javascript "{safe_js}"
-            end tell
-            '''
+            return f"""
+            on run argv
+                set jsCode to item 1 of argv
+                tell application "{app_name}"
+                    execute front window's active tab javascript jsCode
+                end tell
+            end run
+            """
         elif "Safari" in app_name:
-            return f'''
-            tell application "{app_name}"
-                do JavaScript "{safe_js}" in front document
-            end tell
-            '''
+            return f"""
+            on run argv
+                set jsCode to item 1 of argv
+                tell application "{app_name}"
+                    do JavaScript jsCode in front document
+                end tell
+            end run
+            """
         else:
             # Fallback/Assumption: behave like Chrome (Brave, Edge, etc often support same suite)
-             return f'''
-            tell application "{app_name}"
-                execute front window's active tab javascript "{safe_js}"
-            end tell
-            '''
+            return f"""
+            on run argv
+                set jsCode to item 1 of argv
+                tell application "{app_name}"
+                    execute front window's active tab javascript jsCode
+                end tell
+            end run
+            """

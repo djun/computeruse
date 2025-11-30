@@ -30,23 +30,36 @@ class SemanticDriver:
     def _focus_app(self, app_name: Optional[str]) -> ActionResult:
         if not app_name:
             return ActionResult(success=False, reason="app_name required for focus_app")
-        script = f'tell application "{app_name}" to activate'
-        return self._run_osascript(script, f"focus {app_name}")
+        script = """
+        on run argv
+            set targetApp to item 1 of argv
+            tell application targetApp to activate
+        end run
+        """
+        return self._run_osascript(script, f"focus {app_name}", [app_name])
 
     def _insert_text(self, text: str) -> ActionResult:
         if not text:
             return ActionResult(success=False, reason="no text provided")
-        script = f'tell application "System Events" to keystroke {self._escape_osascript_string(text)}'
-        return self._run_osascript(script, "insert_text")
+        script = """
+        on run argv
+            set targetText to item 1 of argv
+            tell application "System Events" to keystroke targetText
+        end run
+        """
+        return self._run_osascript(script, "insert_text", [text])
 
     def _save_document(self) -> ActionResult:
         script = 'tell application "System Events" to keystroke "s" using {command down}'
         return self._run_osascript(script, "save_document")
 
-    def _run_osascript(self, script: str, label: str) -> ActionResult:
+    def _run_osascript(self, script: str, label: str, args: list[str] | None = None) -> ActionResult:
         try:
+            cmd = ["osascript", "-e", script]
+            if args:
+                cmd.extend(args)
             completed = subprocess.run(
-                ["osascript", "-e", script],
+                cmd,
                 capture_output=True,
                 text=True,
                 check=False,
@@ -60,8 +73,3 @@ class SemanticDriver:
         except Exception as exc:
             self.logger.warning("Semantic command %s failed: %s", label, exc)
             return ActionResult(success=False, reason=f"{label} exception: {exc}")
-
-    def _escape_osascript_string(self, text: str) -> str:
-        # Wrap and escape a string for AppleScript keystroke.
-        escaped = text.replace('"', '\\"')
-        return f'"{escaped}"'

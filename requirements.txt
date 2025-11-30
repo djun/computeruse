@@ -9,3 +9,5 @@ pyobjc-framework-Cocoa>=10.0
 pyobjc-framework-Quartz>=10.0
 pyobjc-framework-ApplicationServices>=10.0
 pytest>=7.4.0
+numpy>=1.26.4
+scikit-image>=0.22.0

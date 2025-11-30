@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Optional
+import json
+import re
+from typing import Any, Dict, List, Optional
 
 from macos_cua_agent.agent.cognitive_core import CognitiveCore
 from macos_cua_agent.agent.state_manager import ActionResult, StateManager
@@ -14,7 +16,11 @@ from macos_cua_agent.orchestrator.planning import Plan, Step
 from macos_cua_agent.orchestrator.reflection import Reflector
 from macos_cua_agent.policies.policy_engine import PolicyEngine
 from macos_cua_agent.utils.config import Settings
+from macos_cua_agent.utils.health import run_permission_health_checks
 from macos_cua_agent.utils.logger import get_logger
+from macos_cua_agent.utils.macos_integration import get_display_info
+from macos_cua_agent.utils.ax_utils import draw_som_overlay, flatten_nodes_with_frames
+from macos_cua_agent.utils.ax_pruning import prune_ax_tree_for_prompt
 
 
 class Orchestrator:
@@ -32,19 +38,31 @@ class Orchestrator:
         self.memory = MemoryManager(settings)
         self.planner = PlannerClient(settings)
         self.reflector = Reflector(settings)
+        self.display = get_display_info()
 
         if not settings.enable_hid:
             self.logger.warning("ENABLE_HID is false; actions will run in dry-run mode (no real input).")
 
     def run_task(self, user_prompt: str) -> dict:
+        run_permission_health_checks(self.settings, logger=self.logger)
+        # Capture context first for grounded planning
+        initial_frame, initial_hash = self.vision.capture_with_hash()
+        
         prior_episodes = self.memory.list_episodes()
         prior_semantic = self.memory.search_semantic(user_prompt, top_k=5)
-        plan = self.planner.make_plan(user_prompt, prior_episodes, prior_semantic)
+        
+        # Plan with full context
+        plan = self.planner.make_plan(user_prompt, prior_episodes, prior_semantic, screenshot_b64=initial_frame)
         self.logger.info("Plan %s created with %s steps", plan.id, len(plan.steps))
-        summary = self._run_session(user_prompt=user_prompt, plan=plan)
+        
+        summary = self._run_session(
+            user_prompt=user_prompt, plan=plan, initial_frame=initial_frame, initial_hash=initial_hash
+        )
         return summary
 
-    def _run_session(self, user_prompt: str, plan: Optional[Plan] = None) -> dict:
+    def _run_session(
+        self, user_prompt: str, plan: Optional[Plan] = None, initial_frame: str | None = None, initial_hash: str | None = None
+    ) -> dict:
         state = StateManager(
             max_steps=self.settings.max_steps,
             max_failures=self.settings.max_failures,
@@ -57,10 +75,18 @@ class Orchestrator:
 
         state.history.append(f"user_prompt:{user_prompt}")
 
-        current_frame = self.vision.capture_base64()
-        state.record_observation(current_frame, changed=True, note=f"initial capture for: {user_prompt}")
+        if initial_frame:
+            current_frame = initial_frame
+            current_hash = initial_hash or self.vision.hash_base64(initial_frame)
+        else:
+            current_frame, current_hash = self.vision.capture_with_hash()
+
+        state.record_observation(
+            current_frame, changed=True, note=f"initial capture for: {user_prompt}", phash=current_hash
+        )
 
         last_action_sig: str | None = None
+        action_sig_history: List[str] = []
         repeat_without_change = 0
         repeat_same_action = 0
         repeat_info_for_model: dict | None = None
@@ -70,6 +96,10 @@ class Orchestrator:
         plan_revision_count = 0
         max_plan_revisions = 3
         global_hotkeys = {("cmd", "space"), ("command", "space"), ("cmd", "tab"), ("command", "tab")}
+        low_change_streak = 0
+        PHASH_STATIC_THRESHOLD = 1  # Hamming distance; lower means more similar
+        STAGNATION_LIMIT = 5        # consecutive frames with minimal change
+        current_tags: List[Dict[str, Any]] = []
 
         try:
             while not state.should_halt():
@@ -96,20 +126,66 @@ class Orchestrator:
                 if len(state.history) > 60:
                     self._compress_history(state)
 
+                # Semantic Grounding: Fetch accessibility tree
+                ax_tree = None
+                if self.settings.enable_semantic:
+                    ax_res = self.action_engine.accessibility_driver.get_active_window_tree(max_depth=4)
+                    if ax_res.success:
+                        raw_tree = ax_res.metadata.get("tree")
+                        ax_tree = prune_ax_tree_for_prompt(raw_tree) if raw_tree else None
+                        # self.logger.debug("Fetched AX tree for grounding")
+
+                # Overlay Set-of-Mark tags onto the screenshot for grounding
+                overlay_frame = current_frame
+                current_tags = []
+                if ax_tree:
+                    nodes = flatten_nodes_with_frames(ax_tree, max_nodes=40)
+                    overlay_frame, current_tags = draw_som_overlay(current_frame, nodes, self.display)
+
                 loop_state = self._format_loop_state(plan, state, repeat_same_action, repeat_without_change)
                 action = self.cognitive_core.propose_action(
-                    current_frame,
+                    overlay_frame,
                     state.history,
                     user_prompt=user_prompt,
                     repeat_info=repeat_info_for_model,
                     plan=plan,
                     current_step=current_step,
                     loop_state=loop_state,
+                    ax_tree=ax_tree,
+                    som_tags=current_tags,
                 )
 
                 if action.get("type") == "noop":
                     self.logger.info("Noop action requested; stopping loop. Reason: %s", action.get("reason"))
                     break
+                
+                if action.get("type") == "run_skill":
+                    skill_ref = action.get("skill_id") or action.get("skill_name")
+                    skill = self.memory.get_skill(skill_ref) if skill_ref else None
+                    if not skill:
+                        result = ActionResult(success=False, reason="skill not found")
+                        state.record_action(action, result)
+                        repeat_info_for_model = {
+                            "count": repeat_same_action,
+                            "action": repr(action),
+                            "hint": "Requested skill not found; try a different approach or rebuild it.",
+                        }
+                        continue
+                    self.memory.record_skill_usage(skill.id)
+                    action = {
+                        "type": "macro_actions",
+                        "actions": [dict(a) for a in skill.actions],
+                        "skill_id": skill.id,
+                        "skill_name": skill.name,
+                    }
+
+                # Resolve overlay element references to coordinates
+                resolved_ok = self._resolve_element_references(action, current_tags)
+                if not resolved_ok:
+                    result = ActionResult(success=False, reason="element_id not found")
+                    state.record_action(action, result)
+                    repeat_info_for_model = {"count": repeat_same_action, "action": repr(action), "hint": "element_id not found; request new inspect_ui"}
+                    continue
 
                 # Handle Notebook Operations (Internal State)
                 if action.get("type") == "notebook_op":
@@ -163,16 +239,53 @@ class Orchestrator:
                     if stderr:
                         state.history.append(f"shell_stderr:{stderr[:500]}")
 
-                base_delay = self.settings.verify_delay_ms / 1000
+                verify_after = action.get("verify_after", True)
+                base_delay = self.settings.verify_delay_ms / 1000 if verify_after else 0
+                settle_delay = self.settings.settle_delay_ms / 1000 if verify_after else 0
                 extra_delay = 0.0
-                if action.get("type") == "key":
+                if verify_after and action.get("type") == "key":
                     keys = [k.lower() for k in action.get("keys") or []]
                     if "space" in keys and ("cmd" in keys or "command" in keys):
                         extra_delay = 0.8
-                time.sleep(base_delay + extra_delay)
-                next_frame = self.vision.capture_base64()
-                changed = self.vision.has_changed(current_frame, next_frame)
-                state.record_observation(next_frame, changed)
+                is_interactive = action.get("type") not in {"wait", "capture_only", "noop"}
+                sleep_seconds = max(base_delay, settle_delay if is_interactive else 0) + extra_delay
+                if sleep_seconds > 0:
+                    time.sleep(sleep_seconds)
+
+                next_frame, next_hash = self.vision.capture_with_hash()
+                hash_distance = self.vision.hash_distance(current_hash, next_hash)
+                ssim_score = None
+                ax_tree_after = None
+                ax_changed = False
+
+                if verify_after:
+                    ssim_score = self.vision.structural_similarity(current_frame, next_frame)
+                    if self.settings.enable_semantic:
+                        ax_after_res = self.action_engine.accessibility_driver.get_active_window_tree(max_depth=4)
+                        if ax_after_res.success:
+                            ax_tree_after = ax_after_res.metadata.get("tree")
+                            ax_changed = self._ax_changed(ax_tree, ax_tree_after)
+
+                    changed = self._compute_changed(
+                        current_frame,
+                        next_frame,
+                        hash_distance,
+                        ssim_score,
+                        ax_changed,
+                        phash_static_threshold=PHASH_STATIC_THRESHOLD,
+                    )
+                    obs_note = ""
+                else:
+                    # Optimistic mode: assume change to avoid stalling and skip heavy checks.
+                    changed = True
+                    obs_note = "verify_skipped"
+
+                state.record_observation(
+                    next_frame, changed, phash=next_hash, hash_distance=hash_distance, note=obs_note
+                )
+
+                if action.get("type") == "macro_actions":
+                    self._maybe_save_skill(action, result, current_step, user_prompt, changed)
 
                 if not changed:
                     self.logger.info("No UI change detected after action: %s", action)
@@ -180,8 +293,27 @@ class Orchestrator:
                     # UI changed; allow future hotkeys to be considered fresh.
                     hotkey_counts.clear()
 
+                is_action_interactive = action.get("type") not in {"wait", "capture_only", "noop"}
+                if verify_after:
+                    if hash_distance <= PHASH_STATIC_THRESHOLD and is_action_interactive and not ax_changed:
+                        low_change_streak += 1
+                    else:
+                        low_change_streak = 0
+                else:
+                    low_change_streak = 0
+
                 # Signature used for repeat detection and hinting; set early so failure handling can reference it.
                 action_sig = repr(action)
+                action_sig_history.append(action_sig)
+
+                # N-Gram Cycle Detection
+                cycle_detected = False
+                for k in range(2, 6):
+                    if len(action_sig_history) >= 2 * k:
+                        if action_sig_history[-k:] == action_sig_history[-2*k:-k]:
+                            cycle_detected = True
+                            self.logger.warning("Oscillatory loop detected (length %d)", k)
+                            break
 
                 if plan and current_step:
                     step_completed = False
@@ -198,6 +330,10 @@ class Orchestrator:
                         self.logger.warning("Step %s failed verification: %s (%s)", current_step.id, reflection_result.reason, reflection_result.failure_type)
                         state.history.append(f"reflector_fail:{reflection_result.failure_type}:{reflection_result.reason}")
                         
+                        # TRIGGER DYNAMIC REPLANNING:
+                        # Explicitly mark the step as failed so _should_replan catches it next loop.
+                        plan.fail_current(f"Reflector blocked: {reflection_result.failure_type} - {reflection_result.reason}")
+
                         # Contingency: If we have recovery steps, suggest them to the agent via history
                         if current_step.recovery_steps:
                             recovery_msg = f"recovery_suggestion: Step failed. Try: {', '.join(current_step.recovery_steps)}"
@@ -235,7 +371,12 @@ class Orchestrator:
                 is_wait = action.get("type") == "wait"
                 pending_break = False
                 break_reason = ""
-                if not is_wait:
+                
+                if cycle_detected:
+                    pending_break = True
+                    break_reason = "oscillatory_loop"
+
+                if not is_wait and not pending_break:
                     if action_sig == last_action_sig:
                         repeat_same_action += 1
                         if repeat_same_action >= 3:  # Stricter limit (was 5)
@@ -253,6 +394,11 @@ class Orchestrator:
                 else:
                     repeat_same_action = 0
                     repeat_without_change = 0
+
+                if not pending_break and low_change_streak >= STAGNATION_LIMIT:
+                    pending_break = True
+                    break_reason = "visual_stagnation"
+                    state.history.append(f"visual_stagnation:hash_dist={hash_distance}")
 
                 if action.get("type") == "key":
                     combo = tuple(sorted([k.lower() for k in action.get("keys") or []]))
@@ -303,6 +449,7 @@ class Orchestrator:
                     repeat_same_action = 0
                     repeat_without_change = 0
                     last_action_sig = None
+                    low_change_streak = 0
 
                     if pending_break:
                         self.logger.info("Breaking loop: %s", break_reason or "stuck")
@@ -310,6 +457,7 @@ class Orchestrator:
 
                     repeat_info_for_model = repeat_info_for_model or {"count": 0, "action": action_sig}
                     current_frame = next_frame
+                    current_hash = next_hash
                     continue
 
                 last_action_sig = action_sig
@@ -317,6 +465,7 @@ class Orchestrator:
                     repeat_info_for_model = {"count": repeat_same_action, "action": last_action_sig}
 
                 current_frame = next_frame
+                current_hash = next_hash
         except KeyboardInterrupt:
             self.logger.info("Session cancelled by user.")
 
@@ -367,6 +516,82 @@ class Orchestrator:
             return True
         return False
 
+    def _compute_changed(
+        self,
+        prev_frame: str,
+        next_frame: str,
+        hash_distance: int,
+        ssim_score: float | None,
+        ax_changed: bool,
+        phash_static_threshold: int,
+    ) -> bool:
+        """Blend visual hash, SSIM-like score, and accessibility diffs to reduce false stagnation."""
+        if ax_changed:
+            return True
+
+        if ssim_score is not None and ssim_score < self.settings.ssim_change_threshold:
+            return True
+
+        if hash_distance > phash_static_threshold:
+            return True
+
+        return self.vision.has_changed(prev_frame, next_frame)
+
+    def _ax_changed(self, before: dict | None, after: dict | None) -> bool:
+        if before is None or after is None:
+            return False
+        try:
+            before_str = json.dumps(before, sort_keys=True)
+            after_str = json.dumps(after, sort_keys=True)
+            return before_str != after_str
+        except Exception:
+            return False
+
+    def _maybe_save_skill(
+        self,
+        action: dict,
+        result: ActionResult,
+        current_step: Optional[Step],
+        user_prompt: str,
+        changed: bool,
+    ) -> None:
+        """Persist successful macro_actions as reusable procedural skills."""
+        if action.get("type") != "macro_actions" or not result.success or not changed:
+            return
+        try:
+            name_seed = ""
+            if current_step and getattr(current_step, "description", ""):
+                name_seed = current_step.description
+            elif user_prompt:
+                name_seed = user_prompt
+            name = self._slugify(name_seed)[:50] or f"macro-{int(time.time())}"
+            description = ""
+            if current_step:
+                description = current_step.success_criteria or current_step.description or ""
+            if not description:
+                description = user_prompt or ""
+            tags = ["macro"]
+            if current_step and current_step.id:
+                tags.append(f"step:{current_step.id}")
+            self.memory.save_skill(
+                name=name,
+                description=description,
+                actions=[dict(a) for a in action.get("actions") or []],
+                tags=tags,
+                source_prompt=user_prompt,
+                plan_step_id=current_step.id if current_step else None,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            self.logger.warning("Failed to save procedural skill: %s", exc)
+
+    def _slugify(self, text: str) -> str:
+        """Lightweight slug for skill names."""
+        if not text:
+            return ""
+        lowered = text.strip().lower()
+        slug = re.sub(r"[^a-z0-9]+", "-", lowered).strip("-")
+        return slug or "macro"
+
     def _persist_episode(self, user_prompt: str, state: StateManager, plan: Optional[Plan]) -> None:
         episode_id = plan.id if plan else f"session-{int(state.started_at)}"
         outcome = "success"
@@ -414,3 +639,40 @@ class Orchestrator:
             self.logger.info("Compressing history: %s items -> 1 summary", len(chunk_to_summarize))
             new_history = [state.history[0]] + [f"history_summary:{summary}"] + state.history[21:]
             state.history = new_history
+
+    def _resolve_element_references(self, action: dict, tags: List[Dict[str, Any]]) -> bool:
+        """Translate element_id to x/y (physical px) using the most recent overlay tags."""
+        lookup: Dict[str, Dict[str, Any]] = {str(tag["id"]): tag for tag in tags}
+
+        def _apply(act: dict) -> bool:
+            if act.get("x") is not None and act.get("y") is not None:
+                return True
+            element_id = act.get("element_id")
+            if element_id is None:
+                return True
+            if not lookup:
+                return False
+            tag = lookup.get(str(element_id))
+            if not tag:
+                return False
+            frame = tag.get("frame") or {}
+            try:
+                cx, cy = self._frame_center_px(frame)
+                act["x"] = cx
+                act["y"] = cy
+                return True
+            except Exception:
+                return False
+
+        if action.get("type") == "macro_actions":
+            for sub in action.get("actions") or []:
+                if not _apply(sub):
+                    return False
+            return True
+        return _apply(action)
+
+    def _frame_center_px(self, frame: Dict[str, Any]) -> tuple[float, float]:
+        """Return logical point center for a frame."""
+        cx = float(frame.get("x", 0)) + float(frame.get("w", 0)) / 2.0
+        cy = float(frame.get("y", 0)) + float(frame.get("h", 0)) / 2.0
+        return cx, cy

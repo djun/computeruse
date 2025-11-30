@@ -86,12 +86,84 @@ def has_screen_recording_permission() -> bool:
 
 
 def has_accessibility_permission() -> bool:
+    ax_is_trusted, _, _ = _get_accessibility_api()
+    if not ax_is_trusted:
+        logger.warning("Accessibility API unavailable; returning not trusted.")
+        return False
+
+    try:
+        return bool(ax_is_trusted())
+    except Exception:
+        return False
+
+
+def request_permissions(logger=None) -> bool:
+    """
+    Ask macOS to show permission prompts for Screen Recording and Accessibility.
+    Returns True if a prompt was requested.
+    """
+    logger = logger or get_logger(__name__)
+    try:
+        import Quartz  # type: ignore
+    except Exception as exc:
+        logger.warning("Quartz unavailable; cannot request permissions: %s", exc)
+        return False
+
+    prompted = False
+
+    ax_is_trusted, ax_prompt, ax_prompt_opt = _get_accessibility_api()
+
+    try:
+        if not Quartz.CGPreflightScreenCaptureAccess():
+            Quartz.CGRequestScreenCaptureAccess()
+            prompted = True
+    except Exception as exc:
+        logger.warning("Failed to request Screen Recording permission: %s", exc)
+
+    try:
+        if ax_is_trusted and ax_prompt and ax_prompt_opt:
+            if not ax_is_trusted():
+                ax_prompt({ax_prompt_opt: True})
+                prompted = True
+        elif not ax_is_trusted:
+            logger.warning("Accessibility API unavailable; cannot request permission.")
+    except Exception as exc:
+        logger.warning("Failed to request Accessibility permission: %s", exc)
+
+    if prompted:
+        logger.info("Requested macOS permission prompts; approve them, then restart this app.")
+
+    return prompted
+
+
+def _get_accessibility_api():
+    """
+    Returns (AXIsProcessTrusted, AXIsProcessTrustedWithOptions, kAXTrustedCheckOptionPrompt)
+    trying ApplicationServices first, then Quartz.
+    """
+    try:
+        import ApplicationServices  # type: ignore
+
+        ax_is_trusted = getattr(ApplicationServices, "AXIsProcessTrusted", None)
+        ax_prompt = getattr(ApplicationServices, "AXIsProcessTrustedWithOptions", None)
+        ax_prompt_opt = getattr(ApplicationServices, "kAXTrustedCheckOptionPrompt", None)
+        if ax_is_trusted:
+            return ax_is_trusted, ax_prompt, ax_prompt_opt
+    except Exception:
+        pass
+
     try:
         import Quartz  # type: ignore
 
-        return bool(Quartz.AXIsProcessTrusted())
+        ax_is_trusted = getattr(Quartz, "AXIsProcessTrusted", None)
+        ax_prompt = getattr(Quartz, "AXIsProcessTrustedWithOptions", None)
+        ax_prompt_opt = getattr(Quartz, "kAXTrustedCheckOptionPrompt", None)
+        if ax_is_trusted:
+            return ax_is_trusted, ax_prompt, ax_prompt_opt
     except Exception:
-        return False
+        pass
+
+    return None, None, None
 
 
 def get_system_info() -> str:
@@ -112,4 +184,3 @@ def get_system_info() -> str:
         return f"macOS {ver} ({arch}) on {model}"
     except Exception:
         return "macOS (Unknown System)"
-

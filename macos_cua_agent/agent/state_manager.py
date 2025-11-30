@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import base64
+import tempfile
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
@@ -14,10 +17,12 @@ class ActionResult:
 
 @dataclass
 class Observation:
-    image_b64: str
+    image_path: str
     timestamp: float
     changed_since_last: bool = False
     note: str = ""
+    phash: str | None = None
+    hash_distance: int | None = None
 
 
 @dataclass
@@ -49,8 +54,31 @@ class StateManager:
         self.started_at = time.time()
         self.stuck_reasons: List[str] = []
 
-    def record_observation(self, image_b64: str, changed: bool, note: str = "") -> Observation:
-        obs = Observation(image_b64=image_b64, timestamp=time.time(), changed_since_last=changed, note=note)
+    def record_observation(
+        self,
+        image_b64: str,
+        changed: bool,
+        note: str = "",
+        phash: str | None = None,
+        hash_distance: int | None = None,
+    ) -> Observation:
+        # Offload image to disk to save memory
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".png", prefix=f"obs_{self.steps}_") as tmp:
+                tmp.write(base64.b64decode(image_b64))
+                image_path = tmp.name
+        except Exception:
+            # Fallback if disk write fails
+            image_path = ""
+
+        obs = Observation(
+            image_path=image_path,
+            timestamp=time.time(),
+            changed_since_last=changed,
+            note=note,
+            phash=phash,
+            hash_distance=hash_distance,
+        )
         self.observations.append(obs)
         self.history.append(
             f"observation@{obs.timestamp}:changed={changed}" + (f":{note}" if note else "")

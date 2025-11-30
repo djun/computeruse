@@ -47,9 +47,13 @@ class HIDDriver:
         # Prefer AppleScript for typing to avoid stuck modifiers and flaky event injection on macOS.
         if self.enabled:
             try:
-                safe_text = text.replace("\\", "\\\\").replace('"', '\\"')
-                script = f'tell application "System Events" to keystroke "{safe_text}"'
-                subprocess.run(["osascript", "-e", script], check=True, capture_output=True)
+                script = """
+                on run argv
+                    set targetText to item 1 of argv
+                    tell application "System Events" to keystroke targetText
+                end run
+                """
+                subprocess.run(["osascript", "-e", script, text], check=True, capture_output=True)
                 self.logger.info("HID action executed (via AppleScript): type:%r", text)
                 return ActionResult(success=True)
             except Exception as exc:
@@ -61,8 +65,47 @@ class HIDDriver:
         combo = [self._normalize_key(k) for k in keys if k]
         return self._perform(lambda: self.pg.hotkey(*combo), f"hotkey:{'+'.join(combo)}")
 
-    def scroll(self, clicks: int) -> ActionResult:
+    def scroll(self, clicks: int, axis: str = "vertical") -> ActionResult:
+        if axis == "horizontal":
+            # PyAutoGUI supports hscroll for horizontal scrolling
+            return self._perform(lambda: self.pg.hscroll(clicks), f"hscroll:{clicks}")
         return self._perform(lambda: self.pg.scroll(clicks), f"scroll:{clicks}")
+
+    def drag_and_drop(self, x: float, y: float, tx: float, ty: float, duration: float = 0.5, hold_delay: float = 0.0) -> ActionResult:
+        def _action():
+            sx, sy = self._to_px(x, y)
+            dx, dy = self._to_px(tx, ty)
+            self.pg.moveTo(sx, sy)
+            if hold_delay > 0:
+                import time
+                time.sleep(hold_delay)
+            # Use easeInOutQuad for "human-like" smoothing to avoid anti-bot detection
+            self.pg.dragTo(dx, dy, duration=duration, button='left', mouseDownUp=True, tween=self.pg.easeInOutQuad)
+
+        return self._perform(_action, f"drag({x},{y}->{tx},{ty})")
+    
+    def select_area(self, x: float, y: float, tx: float, ty: float, duration: float = 0.4, hold_delay: float = 0.0) -> ActionResult:
+        def _action():
+            sx, sy = self._to_px(x, y)
+            ex, ey = self._to_px(tx, ty)
+            self.pg.moveTo(sx, sy)
+            if hold_delay > 0:
+                import time
+                time.sleep(hold_delay)
+            # Explicit down/drag/up to simulate click-drag selection without moving objects
+            self.pg.mouseDown(button="left")
+            self.pg.dragTo(ex, ey, duration=duration, button="left")
+            self.pg.mouseUp(button="left")
+
+        return self._perform(_action, f"select_area({x},{y}->{tx},{ty})")
+
+    def hover(self, x: float, y: float, duration: float = 1.0) -> ActionResult:
+        def _action():
+            self.pg.moveTo(*self._to_px(x, y))
+            import time
+            time.sleep(duration)
+
+        return self._perform(_action, f"hover({x},{y}, {duration}s)")
 
     def _perform(self, func, label: str) -> ActionResult:
         if not self.enabled or not self.pg:

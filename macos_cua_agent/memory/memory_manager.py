@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 
 from macos_cua_agent.utils.config import Settings
 from macos_cua_agent.utils.logger import get_logger
+from macos_cua_agent.memory.skill_store import SkillStore, ProceduralSkill
 
 
 @dataclass
@@ -43,9 +44,11 @@ class MemoryManager:
         self.episodes_dir = self.root / "episodes"
         self.semantic_dir = self.root / "semantic"
         self.logs_dir = self.root / "logs"
+        self.skills_dir = self.root / "skills"
         self.embed_client = self._build_embed_client()
-        for path in (self.root, self.episodes_dir, self.semantic_dir, self.logs_dir):
+        for path in (self.root, self.episodes_dir, self.semantic_dir, self.logs_dir, self.skills_dir):
             path.mkdir(parents=True, exist_ok=True)
+        self.skill_store = SkillStore(self.skills_dir, self.logger)
 
     def _build_embed_client(self) -> Optional[Any]:
         if not self.settings.enable_embeddings:
@@ -150,3 +153,31 @@ class MemoryManager:
         if norm_a == 0 or norm_b == 0:
             return 0.0
         return dot / (norm_a * norm_b)
+
+    # Procedural skill helpers
+    def save_skill(
+        self,
+        name: str,
+        description: str,
+        actions: List[Dict[str, Any]],
+        tags: Optional[List[str]] = None,
+        source_prompt: Optional[str] = None,
+        plan_step_id: Optional[str] = None,
+    ) -> ProceduralSkill:
+        return self.skill_store.save_skill(
+            name=name,
+            description=description,
+            actions=actions,
+            tags=tags,
+            source_prompt=source_prompt,
+            plan_step_id=plan_step_id,
+        )
+
+    def list_skills(self) -> List[ProceduralSkill]:
+        return self.skill_store.list_skills()
+
+    def get_skill(self, skill_id_or_name: str) -> Optional[ProceduralSkill]:
+        return self.skill_store.get_skill(skill_id_or_name)
+
+    def record_skill_usage(self, skill_id: str) -> Optional[ProceduralSkill]:
+        return self.skill_store.record_usage(skill_id)
