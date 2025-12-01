@@ -35,7 +35,7 @@ class TestArchitecture(unittest.TestCase):
             ]
         }
         
-        parsed = client._parse_plan_json(json.dumps(raw_json), "test_plan", "do something")
+        parsed = client._parse_plan_response(json.dumps(raw_json), "test_plan", "do something")
         plan = Plan.from_dict(parsed)
         
         self.assertEqual(len(plan.steps), 1)

@@ -12,6 +12,7 @@ from macos_cua_agent.drivers.hid_driver import HIDDriver
 from macos_cua_agent.drivers.semantic_driver import SemanticDriver
 from macos_cua_agent.drivers.shell_driver import ShellDriver
 from macos_cua_agent.policies.policy_engine import PolicyEngine
+from macos_cua_agent.utils.ax_utils import flatten_nodes_with_frames
 from macos_cua_agent.utils.config import Settings
 from macos_cua_agent.utils.logger import get_logger
 from macos_cua_agent.utils.macos_integration import get_display_info
@@ -206,28 +207,54 @@ class ActionEngine:
             return self.hid_driver.scroll(int(clicks), axis=axis)
             
         if action_type == "type":
-            return self.hid_driver.type_text(action.get("text", ""))
+            text = action.get("text", "")
+            if phantom_mode:
+                if x is not None and y is not None:
+                    res = self.accessibility_driver.set_text_element_value(x, y, text)
+                    if res.success:
+                        return res
+                    self.logger.info("Phantom type at coordinates failed, trying focused element")
+                focused_res = self.accessibility_driver.set_focused_element_value(text)
+                if focused_res and focused_res.success:
+                    return focused_res
+                self.logger.info("Phantom type failed, falling back to physical HID")
+            return self.hid_driver.type_text(text)
+
         if action_type == "key":
             keys = action.get("keys") or []
             return self.hid_driver.press_keys(keys)
 
         if action_type == "open_app":
             app_name = action.get("app_name", "")
-            self.logger.info("Executing open_app sequence for: %s", app_name)
+            self.logger.info("Executing open_app for: %s", app_name)
+
+            # 1. Try Semantic Focus first (AppleScript)
+            if self.settings.enable_semantic:
+                res = self.semantic_driver.execute({"command": "focus_app", "app_name": app_name})
+                if res.success:
+                    focused = self.accessibility_driver.get_focused_app_name()
+                    if focused and app_name.lower() in focused.lower():
+                        return res
+                    self.logger.info(
+                        "Semantic focus reported success but focused app was %s; falling back to Spotlight",
+                        focused or "unknown",
+                    )
             
-            # 1. Open Spotlight
+            self.logger.info("Semantic focus failed or disabled; falling back to Spotlight HID sequence")
+            
+            # 2. Open Spotlight
             res = self.hid_driver.press_keys(["command", "space"])
             if not res.success:
                 return res
             time.sleep(0.5) # Wait for Spotlight animation
             
-            # 2. Type App Name
+            # 3. Type App Name
             res = self.hid_driver.type_text(app_name)
             if not res.success:
                 return res
             time.sleep(0.3) # Wait for search results
             
-            # 3. Press Enter
+            # 4. Press Enter
             return self.hid_driver.press_keys(["enter"])
 
         self.logger.warning("Unknown HID action: %s", action)
@@ -242,9 +269,130 @@ class ActionEngine:
                 subresults.append({"index": idx, "success": False, "reason": "nested macro not allowed"})
                 return ActionResult(success=False, reason="nested macro not allowed", metadata={"subresults": subresults})
 
-            res = self.execute(sub_action)
+            adjusted_action = sub_action
+            if self.settings.enable_semantic:
+                adjusted_action, retargeted = self._retarget_action_semantically(sub_action)
+                if retargeted:
+                    self.logger.info("Retargeted macro action %s using semantic hints", sub_action.get("type"))
+
+            res = self.execute(adjusted_action)
             subresults.append({"index": idx, "success": res.success, "reason": res.reason, "action": sub_action})
             if not res.success:
                 return ActionResult(success=False, reason=f"macro step {idx} failed: {res.reason}", metadata={"subresults": subresults})
 
         return ActionResult(success=True, reason="macro complete", metadata={"subresults": subresults})
+
+    def _retarget_action_semantically(self, action: dict) -> tuple[dict, bool]:
+        """
+        Best-effort re-localization of a recorded action using semantic hints (role/label) and the current AX tree.
+        This lets skills adapt when coordinates or overlay IDs from the recording are stale.
+        """
+        pointer_actions = {
+            "left_click",
+            "right_click",
+            "double_click",
+            "hover",
+            "mouse_move",
+            "type",
+            "drag_and_drop",
+            "select_area",
+        }
+        if action.get("type") not in pointer_actions:
+            return action, False
+
+        hint_role = (action.get("semantic_role") or action.get("role") or "").strip()
+        hint_label = (action.get("semantic_label") or action.get("label") or "").strip()
+        hint_path = (action.get("semantic_path") or action.get("path") or "").strip()
+        if not hint_role and not hint_label and not hint_path:
+            return action, False
+
+        ax_res = self.accessibility_driver.get_active_window_tree(max_depth=4)
+        if not ax_res.success:
+            return action, False
+        ax_tree = ax_res.metadata.get("tree")
+        if not ax_tree:
+            return action, False
+
+        nodes = flatten_nodes_with_frames(ax_tree, max_nodes=80)
+        if not nodes:
+            return action, False
+
+        best = self._pick_semantic_node(nodes, hint_role, hint_label, hint_path, action.get("x"), action.get("y"))
+        if not best:
+            return action, False
+
+        frame = best.get("frame") or {}
+        try:
+            cx = float(frame.get("x", 0)) + float(frame.get("w", 0)) / 2.0
+            cy = float(frame.get("y", 0)) + float(frame.get("h", 0)) / 2.0
+        except Exception:
+            return action, False
+
+        updated = dict(action)
+        updated["x"] = cx
+        updated["y"] = cy
+        updated.setdefault("semantic_role", best.get("role", ""))
+        updated.setdefault("semantic_label", best.get("label", ""))
+        return updated, True
+
+    def _pick_semantic_node(
+        self,
+        nodes: list[dict],
+        hint_role: str,
+        hint_label: str,
+        hint_path: str,
+        anchor_x: float | None,
+        anchor_y: float | None,
+    ) -> dict | None:
+        """
+        Score nodes by semantic closeness (role/label) and optionally distance to prior coordinates.
+        Returns the best-matching node or None if nothing reasonable is found.
+        """
+        best = None
+        best_score = 0.0
+        anchor = (anchor_x, anchor_y) if anchor_x is not None and anchor_y is not None else None
+        hint_role_l = hint_role.lower()
+        hint_label_l = hint_label.lower()
+        hint_path_l = hint_path.lower()
+
+        for node in nodes:
+            role = (node.get("role") or "").lower()
+            label = (node.get("label") or "").lower()
+            node_path = (node.get("path") or "").lower()
+            score = 0.0
+
+            if hint_role_l:
+                if role == hint_role_l:
+                    score += 3.0
+                elif hint_role_l in role:
+                    score += 1.5
+
+            if hint_label_l:
+                if label == hint_label_l:
+                    score += 4.0
+                elif hint_label_l in label:
+                    score += 2.0
+
+            if hint_path_l:
+                if node_path == hint_path_l:
+                    score += 5.0
+                elif hint_path_l in node_path:
+                    score += 3.0
+
+            if score <= 0:
+                continue
+
+            if anchor:
+                frame = node.get("frame") or {}
+                cx = float(frame.get("x", 0)) + float(frame.get("w", 0)) / 2.0
+                cy = float(frame.get("y", 0)) + float(frame.get("h", 0)) / 2.0
+                dx = cx - anchor[0]
+                dy = cy - anchor[1]
+                # Small tie-breaker favoring proximity to the original coordinate
+                score -= math.hypot(dx, dy) * 0.001
+
+            if score > best_score:
+                best_score = score
+                best = node
+
+        return best if best_score > 0 else None

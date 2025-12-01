@@ -124,7 +124,7 @@ class TestExtensions(unittest.TestCase):
 
     @patch("subprocess.check_output")
     def test_clipboard_redaction(self, mock_paste):
-        mock_paste.return_value = b"AKIA1234567890TEST"  # Looks like AWS access key -> should redact
+        mock_paste.return_value = b"AKIA" + b"1" * 16  # Looks like AWS access key -> should redact
         engine = ActionEngine(self.settings, self.policy)
 
         result = engine.execute({"type": "clipboard_op", "sub_action": "read"})

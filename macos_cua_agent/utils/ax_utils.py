@@ -27,11 +27,19 @@ def flatten_nodes_with_frames(tree: Dict[str, Any], max_nodes: int = 40) -> List
             return value
         return role or "element"
 
-    def _walk(node: Dict[str, Any]) -> None:
+    def _crumb(node: Dict[str, Any]) -> str:
+        role = (node.get("role") or "").strip()
+        label = _label_for(node)
+        if role and label:
+            return f"{role}:{label}"
+        return label or role or "element"
+
+    def _walk(node: Dict[str, Any], path: List[str]) -> None:
         if len(nodes) >= max_nodes:
             return
         frame = node.get("frame") or {}
         if frame and frame.get("w", 0) > 0 and frame.get("h", 0) > 0:
+            path_str = " > ".join(path + [_crumb(node)])
             nodes.append(
                 {
                     "frame": {
@@ -42,15 +50,16 @@ def flatten_nodes_with_frames(tree: Dict[str, Any], max_nodes: int = 40) -> List
                     },
                     "role": (node.get("role") or "").strip(),
                     "label": _label_for(node),
+                    "path": path_str,
                 }
             )
         for child in node.get("children") or []:
             if len(nodes) >= max_nodes:
                 return
-            _walk(child)
+            _walk(child, path + [_crumb(node)])
 
     if tree:
-        _walk(tree)
+        _walk(tree, [])
 
     # Attach stable IDs after traversal
     for idx, n in enumerate(nodes, start=1):
@@ -113,6 +122,7 @@ def draw_som_overlay(
                 "id": node["id"],
                 "role": node.get("role", ""),
                 "label": node.get("label", ""),
+                "path": node.get("path", ""),
                 "frame": frame,
             }
         )

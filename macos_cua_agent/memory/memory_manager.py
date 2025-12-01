@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional
 from macos_cua_agent.utils.config import Settings
 from macos_cua_agent.utils.logger import get_logger
 from macos_cua_agent.memory.skill_store import SkillStore, ProceduralSkill
+from macos_cua_agent.utils.text import tokenize_lower
 
 
 @dataclass
@@ -154,6 +155,36 @@ class MemoryManager:
             return 0.0
         return dot / (norm_a * norm_b)
 
+    def _extract_semantic_hints(self, actions: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Capture lightweight semantic hints for later matching: roles, labels, action types.
+        This enables future generalization beyond raw coordinates.
+        """
+        hints: Dict[str, Any] = {"roles": [], "labels": [], "types": [], "paths": []}
+        for act in actions or []:
+            act_type = act.get("type")
+            if act_type:
+                hints["types"].append(act_type)
+            role = act.get("role") or act.get("semantic_role")
+            label = act.get("label") or act.get("semantic_label")
+            path = act.get("semantic_path") or act.get("path")
+            if role:
+                hints["roles"].append(role)
+            if label:
+                hints["labels"].append(label)
+            if path:
+                hints["paths"].append(path)
+                # Also break path into crumbs so we can match partial hierarchy later.
+                for crumb in str(path).split(">"):
+                    crumb_clean = crumb.strip()
+                    if crumb_clean:
+                        hints["labels"].append(crumb_clean)
+        hints["roles"] = sorted(set(hints["roles"]))
+        hints["labels"] = sorted(set(hints["labels"]))
+        hints["types"] = sorted(set(hints["types"]))
+        hints["paths"] = sorted(set(hints["paths"]))
+        return hints
+
     # Procedural skill helpers
     def save_skill(
         self,
@@ -164,6 +195,11 @@ class MemoryManager:
         source_prompt: Optional[str] = None,
         plan_step_id: Optional[str] = None,
     ) -> ProceduralSkill:
+        embedding = None
+        semantic_hints = self._extract_semantic_hints(actions)
+        if self.embed_client:
+            text_for_embed = f"{name}\n{description}\n{semantic_hints}"
+            embedding = self._embed_text(text_for_embed)
         return self.skill_store.save_skill(
             name=name,
             description=description,
@@ -171,6 +207,8 @@ class MemoryManager:
             tags=tags,
             source_prompt=source_prompt,
             plan_step_id=plan_step_id,
+            embedding=embedding,
+            semantic_hints=semantic_hints,
         )
 
     def list_skills(self) -> List[ProceduralSkill]:
@@ -181,3 +219,42 @@ class MemoryManager:
 
     def record_skill_usage(self, skill_id: str) -> Optional[ProceduralSkill]:
         return self.skill_store.record_usage(skill_id)
+
+    def search_skills(self, query: str, top_k: int = 5) -> List[ProceduralSkill]:
+        skills = self.list_skills()
+        if not skills:
+            return []
+
+        # If embeddings are available, use vector search; otherwise use improved keyword scoring.
+        if self.embed_client:
+            query_embedding = self._embed_text(query)
+            if query_embedding:
+                scored = []
+                for skill in skills:
+                    if not skill.embedding:
+                        continue
+                    sim = self._cosine_similarity(query_embedding, skill.embedding)
+                    scored.append((sim, skill))
+                scored.sort(key=lambda x: x[0], reverse=True)
+                return [s for _, s in scored[:top_k]]
+
+        # Keyword fallback with token overlap
+        query_tokens = tokenize_lower(query)
+        scored = []
+        for skill in skills:
+            hint_text = ""
+            if getattr(skill, "semantic_hints", None):
+                hints = skill.semantic_hints
+                hint_text = " ".join(
+                    (hints.get("roles") or []) + (hints.get("labels") or []) + (hints.get("types") or [])
+                )
+            text = (skill.name + " " + skill.description + " " + " ".join(skill.tags) + " " + hint_text).lower()
+            skill_tokens = tokenize_lower(text)
+            overlap = len(query_tokens & skill_tokens)
+            exact = 5 if query.lower() in text else 0
+            score = exact + overlap
+            if score > 0:
+                scored.append((score, skill))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [s for _, s in scored[:top_k]]

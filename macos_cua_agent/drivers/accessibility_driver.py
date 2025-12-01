@@ -17,6 +17,7 @@ try:
         AXUIElementPerformAction,
         AXUIElementCopyActionNames,
         kAXFocusedApplicationAttribute,
+        kAXFocusedUIElementAttribute,
         kAXFocusedWindowAttribute,
         kAXChildrenAttribute,
         kAXParentAttribute,
@@ -27,6 +28,7 @@ try:
         kAXSizeAttribute,
         kAXSubroleAttribute,
         kAXRoleDescriptionAttribute,
+        AXUIElementSetAttributeValue,
     )
     from CoreFoundation import CFArrayGetCount, CFArrayGetValueAtIndex
     HAS_AX = True
@@ -45,6 +47,48 @@ class AccessibilityDriver:
         self.logger = get_logger(__name__, level=settings.log_level)
         if not HAS_AX:
             self.logger.warning("pyobjc ApplicationServices not found; AccessibilityDriver disabled.")
+
+    def set_focused_element_value(self, value: str) -> ActionResult:
+        """
+        Sets the value of the currently focused element (if it supports kAXValueAttribute).
+        Useful when we know focus is correct but don't want to move the mouse.
+        """
+        if not HAS_AX:
+            return ActionResult(success=False, reason="Accessibility API unavailable")
+
+        try:
+            system_wide = AXUIElementCreateSystemWide()
+            err, element = AXUIElementCopyAttributeValue(system_wide, kAXFocusedUIElementAttribute, None)
+            if err != 0 or not element:
+                return ActionResult(success=False, reason="No focused element to set")
+
+            res = self._set_value_on_element_or_parents(element, value, max_ancestors=3)
+            if res:
+                return res
+            return ActionResult(success=False, reason="Focused element does not accept text")
+        except Exception as exc:
+            return ActionResult(success=False, reason=f"Focused set failed: {exc}")
+
+    def set_text_element_value(self, x: float, y: float, value: str) -> ActionResult:
+        """
+        Sets the value of an editable text element at (x, y) using AXValue.
+        Phantom mode for typing.
+        """
+        if not HAS_AX:
+            return ActionResult(success=False, reason="Accessibility API unavailable")
+
+        try:
+            system_wide = AXUIElementCreateSystemWide()
+            err, element = AXUIElementCopyElementAtPosition(system_wide, x, y, None)
+            if err != 0 or not element:
+                return ActionResult(success=False, reason=f"No element found at ({x}, {y})")
+
+            res = self._set_value_on_element_or_parents(element, value, max_ancestors=3)
+            if res:
+                return res
+            return ActionResult(success=False, reason="Failed to set AXValue on target or parents")
+        except Exception as e:
+            return ActionResult(success=False, reason=f"Phantom type failed: {e}")
 
     def get_active_window_tree(self, max_depth: int = 5) -> ActionResult:
         """
@@ -82,6 +126,22 @@ class AccessibilityDriver:
         except Exception as e:
             self.logger.exception("Failed to capture accessibility tree")
             return ActionResult(success=False, reason=f"AX error: {str(e)}")
+
+    def get_focused_app_name(self) -> str | None:
+        """Return the focused application's title (best-effort)."""
+        if not HAS_AX:
+            return None
+        try:
+            system_wide = AXUIElementCreateSystemWide()
+            err, app = AXUIElementCopyAttributeValue(system_wide, kAXFocusedApplicationAttribute, None)
+            if err != 0 or not app:
+                return None
+            title = self._get_attr(app, kAXTitleAttribute)
+            if title:
+                return str(title)
+        except Exception:
+            return None
+        return None
 
     def probe_element(self, x: float, y: float, radius: float = 0.0) -> ActionResult:
         """
@@ -236,6 +296,28 @@ class AccessibilityDriver:
                 return value
         except Exception:
             pass
+        return None
+
+    def _set_value_on_element_or_parents(self, element: Any, value: str, max_ancestors: int = 3) -> ActionResult | None:
+        """Try setting kAXValueAttribute on the element, walking up to parents."""
+        try:
+            err = AXUIElementSetAttributeValue(element, kAXValueAttribute, value)
+            if err == 0:
+                return ActionResult(success=True, reason="set AXValue successfully")
+            curr = element
+            attempts = 0
+            while curr and attempts < max_ancestors:
+                err, parent = AXUIElementCopyAttributeValue(curr, kAXParentAttribute, None)
+                if err == 0 and parent:
+                    err = AXUIElementSetAttributeValue(parent, kAXValueAttribute, value)
+                    if err == 0:
+                        return ActionResult(success=True, reason="set AXValue on parent successfully")
+                    curr = parent
+                    attempts += 1
+                else:
+                    break
+        except Exception:
+            return None
         return None
 
     def _is_useful_node(self, node: Dict[str, Any]) -> bool:

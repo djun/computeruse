@@ -249,6 +249,7 @@ class CognitiveCore:
         loop_state: Optional[Dict[str, Any]] = None,
         ax_tree: Optional[Dict[str, Any]] = None,
         som_tags: Optional[List[Dict[str, Any]]] = None,
+        relevant_skills: Optional[List[Any]] = None,
     ) -> Dict[str, Any]:
         """Return the next action as a dict with at least a `type` field."""
         if not self.client:
@@ -269,6 +270,7 @@ class CognitiveCore:
                 loop_state=loop_state,
                 ax_tree=ax_tree,
                 som_tags=som_tags,
+                relevant_skills=relevant_skills,
             )
             parsed_action = self._parse_tool_call(response)
             if parsed_action:
@@ -289,6 +291,7 @@ class CognitiveCore:
         loop_state: Optional[Dict[str, Any]],
         ax_tree: Optional[Dict[str, Any]],
         som_tags: Optional[List[Dict[str, Any]]],
+        relevant_skills: Optional[List[Any]],
     ) -> Any:
         """Send a vision + tool-calling request to OpenRouter."""
         plan_text = "No structured plan; infer progress from the user's request."
@@ -321,6 +324,13 @@ class CognitiveCore:
             if loop_bits:
                 loop_state_text += "Loop state: " + ", ".join(loop_bits)
 
+        skills_context = ""
+        if relevant_skills:
+            skills_lines = []
+            for s in relevant_skills:
+                skills_lines.append(f"- {s.name} (ID: {s.id}): {s.description}")
+            skills_context = "\nRelevant Skills/Macros:\n" + "\n".join(skills_lines) + "\nUse `run_skill` with the ID if applicable.\n"
+
         ax_context = ""
         som_context = ""
         if ax_tree:
@@ -352,6 +362,7 @@ class CognitiveCore:
             - You may return a *macro action* by supplying `actions: [...]` to batch multiple low-level steps in one call.
             {plan_text}
             {loop_state_text}
+            {skills_context}
             {ax_context}
             {som_context}
 
@@ -585,7 +596,15 @@ class CognitiveCore:
                 "axis": args.get("axis", "vertical")
             })
         if action == "type":
-            return _apply_verify({"type": "type", "text": args.get("text", "")})
+            payload = {"type": "type", "text": args.get("text", "")}
+            if args.get("element_id") is not None:
+                payload["element_id"] = args.get("element_id")
+            if args.get("phantom_mode") is not None:
+                payload["phantom_mode"] = bool(args.get("phantom_mode"))
+            # If the model provided an element_id but no explicit phantom flag, default to phantom for reliability.
+            if args.get("element_id") is not None and args.get("phantom_mode") is None:
+                payload["phantom_mode"] = True
+            return _apply_verify(payload)
         if action == "hotkey":
             return _apply_verify({"type": "key", "keys": args.get("keys") or []})
         if action == "wait":

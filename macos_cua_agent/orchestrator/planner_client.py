@@ -54,7 +54,7 @@ class PlannerClient:
             "First, THINK step-by-step about the user request, the current screen state, and potential obstacles. "
             "Then, output a JSON object with an ordered `steps` array.\n"
             "Each step must have: id (int), description (string), success_criteria (string), status (pending|in_progress|done|failed), notes (string), expected_state (string), recovery_steps (array of strings), sub_steps (array of strings).\n"
-            "- Split the task into 3-7 small, verifiable steps.\n"
+            "- Split the task into 3-7 small, verifiable steps. Keep main steps HIGH-LEVEL and list concrete clicks/fields in sub_steps.\n"
             "- Apply SMART goal principles.\n"
             "- 'sub_steps': Break complex steps into atomic actions (e.g. 'Click File', 'Select Print').\n"
             "- 'description': Specific and Action-oriented.\n"

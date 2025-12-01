@@ -8,6 +8,7 @@ from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from macos_cua_agent.utils.text import tokenize_lower
 
 def _fingerprint_actions(actions: List[Dict[str, Any]]) -> str:
     """Stable hash of a macro action list for deduplication."""
@@ -29,6 +30,8 @@ class ProceduralSkill:
     fingerprint: str = ""
     source_prompt: Optional[str] = None
     plan_step_id: Optional[str] = None
+    embedding: Optional[List[float]] = None
+    semantic_hints: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, raw: Dict[str, Any]) -> "ProceduralSkill":
@@ -45,6 +48,8 @@ class ProceduralSkill:
             fingerprint=raw.get("fingerprint", ""),
             source_prompt=raw.get("source_prompt"),
             plan_step_id=raw.get("plan_step_id"),
+            embedding=raw.get("embedding"),
+            semantic_hints=raw.get("semantic_hints", {}) or {},
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -67,6 +72,8 @@ class SkillStore:
         tags: Optional[List[str]] = None,
         source_prompt: Optional[str] = None,
         plan_step_id: Optional[str] = None,
+        embedding: Optional[List[float]] = None,
+        semantic_hints: Optional[Dict[str, Any]] = None,
     ) -> ProceduralSkill:
         """Persist a skill; deduplicate by action fingerprint."""
         cleaned_actions = [dict(a) for a in (actions or []) if isinstance(a, dict)]
@@ -84,6 +91,10 @@ class SkillStore:
                 existing.tags = sorted(merged)
             if description and not existing.description:
                 existing.description = description
+            if embedding:
+                existing.embedding = embedding
+            if semantic_hints:
+                existing.semantic_hints = semantic_hints
             self._write(existing)
             return existing
 
@@ -99,6 +110,8 @@ class SkillStore:
             fingerprint=fingerprint,
             source_prompt=source_prompt,
             plan_step_id=plan_step_id,
+            embedding=embedding,
+            semantic_hints=semantic_hints or {},
         )
         self._write(skill)
         return skill

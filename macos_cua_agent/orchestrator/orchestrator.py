@@ -97,7 +97,7 @@ class Orchestrator:
         max_plan_revisions = 3
         global_hotkeys = {("cmd", "space"), ("command", "space"), ("cmd", "tab"), ("command", "tab")}
         low_change_streak = 0
-        PHASH_STATIC_THRESHOLD = 1  # Hamming distance; lower means more similar
+        PHASH_STATIC_THRESHOLD = 4  # Hamming distance; increased to ignore noise
         STAGNATION_LIMIT = 5        # consecutive frames with minimal change
         current_tags: List[Dict[str, Any]] = []
 
@@ -135,6 +135,18 @@ class Orchestrator:
                         ax_tree = prune_ax_tree_for_prompt(raw_tree) if raw_tree else None
                         # self.logger.debug("Fetched AX tree for grounding")
 
+                # Visual Fallback if AX failed or is empty
+                if not ax_tree:
+                    vision_elements = self.vision.detect_ui_elements(current_frame)
+                    if vision_elements:
+                        self.logger.info("Using Visual Grounding (Blobs) as fallback, found %d elements", len(vision_elements))
+                        ax_tree = {
+                            "role": "AXWindow",
+                            "title": "Visual Fallback",
+                            "children": vision_elements,
+                            "frame": {"x": 0, "y": 0, "w": self.display.logical_width, "h": self.display.logical_height}
+                        }
+
                 # Overlay Set-of-Mark tags onto the screenshot for grounding
                 overlay_frame = current_frame
                 current_tags = []
@@ -143,6 +155,13 @@ class Orchestrator:
                     overlay_frame, current_tags = draw_som_overlay(current_frame, nodes, self.display)
 
                 loop_state = self._format_loop_state(plan, state, repeat_same_action, repeat_without_change)
+                
+                # Retrieve relevant skills
+                relevant_skills = []
+                query_text = (current_step.description if current_step else "") or user_prompt or ""
+                if query_text:
+                    relevant_skills = self.memory.search_skills(query_text)
+
                 action = self.cognitive_core.propose_action(
                     overlay_frame,
                     state.history,
@@ -153,6 +172,7 @@ class Orchestrator:
                     loop_state=loop_state,
                     ax_tree=ax_tree,
                     som_tags=current_tags,
+                    relevant_skills=relevant_skills,
                 )
 
                 if action.get("type") == "noop":
@@ -184,7 +204,10 @@ class Orchestrator:
                 if not resolved_ok:
                     result = ActionResult(success=False, reason="element_id not found")
                     state.record_action(action, result)
-                    repeat_info_for_model = {"count": repeat_same_action, "action": repr(action), "hint": "element_id not found; request new inspect_ui"}
+                    repeat_info_for_model = {"count": repeat_same_action, "action": repr(action), "hint": "element_id not found; request new inspect_ui. Grounding refreshed."}
+                    # Immediately refresh grounding so the next loop has fresh SoM/AX context
+                    current_frame, current_hash, current_tags, ax_tree = self._refresh_grounding(state)
+                    continue
                     continue
 
                 # Handle Notebook Operations (Internal State)
@@ -240,19 +263,44 @@ class Orchestrator:
                         state.history.append(f"shell_stderr:{stderr[:500]}")
 
                 verify_after = action.get("verify_after", True)
-                base_delay = self.settings.verify_delay_ms / 1000 if verify_after else 0
-                settle_delay = self.settings.settle_delay_ms / 1000 if verify_after else 0
+                is_interactive = action.get("type") not in {"wait", "capture_only", "noop"}
+                
                 extra_delay = 0.0
                 if verify_after and action.get("type") == "key":
                     keys = [k.lower() for k in action.get("keys") or []]
                     if "space" in keys and ("cmd" in keys or "command" in keys):
-                        extra_delay = 0.8
-                is_interactive = action.get("type") not in {"wait", "capture_only", "noop"}
-                sleep_seconds = max(base_delay, settle_delay if is_interactive else 0) + extra_delay
-                if sleep_seconds > 0:
-                    time.sleep(sleep_seconds)
+                        extra_delay = 0.5
 
-                next_frame, next_hash = self.vision.capture_with_hash()
+                if verify_after and is_interactive:
+                    # 1. Mandatory minimal wait for system reaction
+                    time.sleep(0.2 + extra_delay)
+                    
+                    # 2. Dynamic Stabilization
+                    stabilize_timeout = max(2.0, self.settings.settle_delay_ms / 1000.0)
+                    start_time = time.time()
+                    last_poll_frame = self.vision.capture_base64()
+                    stable_frames = 0
+                    
+                    while (time.time() - start_time) < stabilize_timeout:
+                        time.sleep(0.15)
+                        current_poll_frame = self.vision.capture_base64()
+                        
+                        # Threshold 0.002 implies very little pixel change (stabilized)
+                        if not self.vision.has_changed(last_poll_frame, current_poll_frame, threshold=0.002):
+                            stable_frames += 1
+                        else:
+                            stable_frames = 0
+                        
+                        last_poll_frame = current_poll_frame
+                        
+                        if stable_frames >= 2: # ~300ms stability
+                            break
+                    
+                    next_frame = last_poll_frame
+                    next_hash = self.vision.hash_base64(next_frame)
+                else:
+                    next_frame, next_hash = self.vision.capture_with_hash()
+
                 hash_distance = self.vision.hash_distance(current_hash, next_hash)
                 ssim_score = None
                 ax_tree_after = None
@@ -318,7 +366,10 @@ class Orchestrator:
                 if plan and current_step:
                     step_completed = False
                     reflection_result = None
-                    if self.reflector.available:
+                    deterministic_complete = self._deterministic_step_complete(current_step, ax_tree_after, changed)
+                    if deterministic_complete:
+                        step_completed = True
+                    elif self.reflector.available:
                         reflection_result = self.reflector.evaluate_step(
                             current_step, state.history, next_frame, changed
                         )
@@ -333,6 +384,12 @@ class Orchestrator:
                         # TRIGGER DYNAMIC REPLANNING:
                         # Explicitly mark the step as failed so _should_replan catches it next loop.
                         plan.fail_current(f"Reflector blocked: {reflection_result.failure_type} - {reflection_result.reason}")
+
+                        # Dedicated Recovery for Popups
+                        failure_type_norm = (reflection_result.failure_type or "").lower()
+                        reason_lower = (reflection_result.reason or "").lower()
+                        if failure_type_norm in {"popup_blocking", "blocked_by_popup", "popup", "wrong_app"} or "popup" in reason_lower:
+                            self._run_recovery(failure_type_norm or reflection_result.failure_type)
 
                         # Contingency: If we have recovery steps, suggest them to the agent via history
                         if current_step.recovery_steps:
@@ -489,6 +546,23 @@ class Orchestrator:
             return True
         return False
 
+    def _run_recovery(self, failure_type: str) -> None:
+        """Quick, deterministic recovery steps for common failure types."""
+        # Press Escape twice to clear popups/dialogs
+        if failure_type in {"popup_blocking", "blocked_by_popup", "popup"}:
+            self.logger.info("Recovery: attempting ESC to clear popup")
+            self.action_engine.execute({"type": "key", "keys": ["escape"]})
+            time.sleep(0.3)
+            self.action_engine.execute({"type": "key", "keys": ["escape"]})
+            time.sleep(0.3)
+        # Click desktop background to reset focus if wrong app
+        if failure_type in {"wrong_app"}:
+            width, height = self.display.logical_width, self.display.logical_height
+            self.logger.info("Recovery: clicking desktop to reset focus")
+            self.action_engine.execute(
+                {"type": "left_click", "x": width * 0.05, "y": height * 0.95, "phantom_mode": False}
+            )
+
     def _format_loop_state(
         self, plan: Optional[Plan], state: StateManager, repeat_same_action: int, repeat_without_change: int
     ) -> dict:
@@ -514,6 +588,40 @@ class Orchestrator:
         # Require a direct UI interaction before auto-completing.
         if action.get("type") in {"left_click", "double_click", "right_click", "type", "scroll", "key", "mouse_move", "open_app"}:
             return True
+        return False
+
+    def _deterministic_step_complete(self, step: Step, ax_tree_after: dict | None, changed: bool) -> bool:
+        """
+        Fast programmatic verification using AX tree when possible before invoking the reflector.
+        Examples:
+        - success_criteria contains a window title and the title appears
+        - success_criteria mentions a button/text disappearing and it is gone
+        """
+        if not changed or not ax_tree_after or not step.success_criteria:
+            return False
+
+        criteria = step.success_criteria.lower()
+
+        def _walk(node: dict) -> list[dict]:
+            nodes = [node]
+            for child in node.get("children") or []:
+                nodes.extend(_walk(child))
+            return nodes
+
+        nodes = _walk(ax_tree_after)
+        titles = [str(n.get("title") or "").lower() for n in nodes if n.get("title")]
+        roles = [str(n.get("role") or "").lower() for n in nodes if n.get("role")]
+
+        # If success criteria mentions a specific title/keyword, check presence
+        for token in re.findall(r"[a-z0-9]{3,}", criteria):
+            if token in titles:
+                return True
+
+        # If criteria suggests a window/dialog is closed, verify by absence
+        if "dialog" in criteria or "popup" in criteria:
+            if not any("dialog" in r for r in roles):
+                return True
+
         return False
 
     def _compute_changed(
@@ -660,6 +768,13 @@ class Orchestrator:
                 cx, cy = self._frame_center_px(frame)
                 act["x"] = cx
                 act["y"] = cy
+                # Enrich action with semantic hints for downstream skill generalization
+                if "semantic_role" not in act and tag.get("role"):
+                    act["semantic_role"] = tag.get("role")
+                if "semantic_label" not in act and tag.get("label"):
+                    act["semantic_label"] = tag.get("label")
+                if "semantic_path" not in act and tag.get("path"):
+                    act["semantic_path"] = tag.get("path")
                 return True
             except Exception:
                 return False
@@ -676,3 +791,23 @@ class Orchestrator:
         cx = float(frame.get("x", 0)) + float(frame.get("w", 0)) / 2.0
         cy = float(frame.get("y", 0)) + float(frame.get("h", 0)) / 2.0
         return cx, cy
+
+    def _refresh_grounding(self, state: StateManager) -> tuple[str, str, List[Dict[str, Any]], dict | None]:
+        """
+        Capture a new frame, hash, tags, and AX tree immediately.
+        Used when element references fail so the next action proposal has fresh context.
+        """
+        frame, phash = self.vision.capture_with_hash()
+        ax_tree = None
+        if self.settings.enable_semantic:
+            ax_res = self.action_engine.accessibility_driver.get_active_window_tree(max_depth=4)
+            if ax_res.success:
+                raw_tree = ax_res.metadata.get("tree")
+                ax_tree = prune_ax_tree_for_prompt(raw_tree) if raw_tree else None
+        tags: List[Dict[str, Any]] = []
+        overlay_frame = frame
+        if ax_tree:
+            nodes = flatten_nodes_with_frames(ax_tree, max_nodes=40)
+            overlay_frame, tags = draw_som_overlay(frame, nodes, self.display)
+        state.record_observation(overlay_frame, changed=True, phash=phash, note="grounding_refresh")
+        return overlay_frame, phash, tags, ax_tree

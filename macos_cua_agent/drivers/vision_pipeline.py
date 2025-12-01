@@ -136,6 +136,114 @@ class VisionPipeline:
             self.logger.debug("SSIM computation failed: %s", exc)
             return None
 
+    def detect_ui_elements(self, image_b64: str) -> list[dict]:
+        """
+        Fallback: Uses skimage to find potential UI elements (blobs/contours).
+        Returns list of dicts mimicking AX nodes. Includes optional OCR text boxes when pytesseract is available.
+        """
+        try:
+            img = self._decode(image_b64)
+        except Exception as exc:
+            self.logger.warning("Vision blob/OCR decode failed: %s", exc)
+            return []
+
+        elements: list[dict] = []
+
+        # 1) OCR-based text boxes (if pytesseract installed)
+        try:
+            import pytesseract  # type: ignore
+
+            ocr_data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+            n_boxes = len(ocr_data.get("text", []))
+            for i in range(n_boxes):
+                text = (ocr_data["text"][i] or "").strip()
+                conf = float(ocr_data.get("conf", [0])[i] or 0)
+                if not text or conf < 55:  # discard low-confidence/no-text boxes
+                    continue
+                x, y, w, h = (
+                    int(ocr_data["left"][i]),
+                    int(ocr_data["top"][i]),
+                    int(ocr_data["width"][i]),
+                    int(ocr_data["height"][i]),
+                )
+                if w <= 0 or h <= 0:
+                    continue
+                elements.append(
+                    {
+                        "role": "AXStaticText",
+                        "title": text,
+                        "label": text,
+                        "frame": {"x": x, "y": y, "w": w, "h": h},
+                        "source": "ocr",
+                    }
+                )
+        except ImportError:
+            # pytesseract is optional; silently skip if unavailable
+            pass
+        except Exception as exc:
+            self.logger.debug("OCR detection failed: %s", exc)
+
+        # 2) Vision blobs via skimage (if available)
+        try:
+            if skimage_ssim is not None:
+                from skimage import filters, measure, morphology
+                import numpy as np
+
+                gray = np.array(img.convert("L"))
+
+                # Edge detection (Sobel)
+                edges = filters.sobel(gray)
+
+                # Threshold to get binary mask (heuristic)
+                mask = edges > 0.04
+
+                # Close gaps to form solid shapes
+                closed = morphology.closing(mask, morphology.square(3))
+
+                # Label regions
+                labels = measure.label(closed)
+                props = measure.regionprops(labels)
+
+                min_area = 100  # 10x10 px
+                max_area = (img.width * img.height) / 4
+
+                for prop in props:
+                    if prop.area < min_area or prop.area > max_area:
+                        continue
+
+                    minr, minc, maxr, maxc = prop.bbox
+                    # bbox is (min_row, min_col, max_row, max_col) -> (y, x, y+h, x+w)
+
+                    elements.append(
+                        {
+                            "role": "AXUnknown",  # Generic
+                            "title": "visual_element",
+                            "frame": {
+                                "x": minc,
+                                "y": minr,
+                                "w": maxc - minc,
+                                "h": maxr - minr,
+                            },
+                            "source": "vision_blob",
+                        }
+                    )
+        except Exception as e:
+            self.logger.warning("Vision blob detection failed: %s", e)
+
+        # Prioritize text boxes, then blobs; cap to avoid clutter
+        if elements:
+            # Largest areas first, but keep OCR entries on top by adding a bias
+            def _score(elem: dict) -> float:
+                frame = elem.get("frame") or {}
+                area = float(frame.get("w", 0)) * float(frame.get("h", 0))
+                bias = 1e6 if elem.get("source") == "ocr" else 0.0
+                return bias + area
+
+            elements.sort(key=_score, reverse=True)
+            return elements[:80]
+
+        return []
+
     def _decode(self, image_b64: str) -> Image.Image:
         raw = base64.b64decode(image_b64)
         return Image.open(io.BytesIO(raw)).convert("RGB")
