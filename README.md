@@ -18,6 +18,10 @@ Environment variables (place in `.env`):
 - Semantic memory embeddings are optional: `ENABLE_EMBEDDINGS=true`, `EMBEDDING_API_KEY`/`OPENAI_API_KEY`, `EMBEDDING_BASE_URL` (default OpenAI), and `EMBEDDING_MODEL` (default `text-embedding-3-small`).
 - `ENABLE_HID`=true to send real mouse/keyboard events via `pyautogui`.
 - `ENABLE_SEMANTIC`=true to route actions through the semantic driver (AppleScript-based focus/insert/save).
+- `ENABLE_SHELL`=true to enable sandboxed shell execution (default false). Configure with `SHELL_WORKSPACE_ROOT` (default `.agent_shell`), `SHELL_MAX_RUNTIME_S` (default 10), and `SHELL_MAX_OUTPUT_BYTES` (default 65536).
+- `STRICT_STEP_COMPLETION`=true to enforce strict step verification (default true).
+- `REASONING_EFFORT` (high/medium/low) and `REASONING_MAX_TOKENS` for reasoning models.
+- `BROWSER_SCRIPT_TIMEOUT_S` and `BROWSER_NAVIGATION_TIMEOUT_S` for browser interaction safety.
 - `MAX_STEPS`, `MAX_FAILURES`, `MAX_WALL_CLOCK_SECONDS`, `VERIFY_DELAY_MS`, `LOG_LEVEL`, `ENCODE_FORMAT`.
 - `MEMORY_ROOT` to change where episodic/semantic logs are persisted (default `.agent_memory`).
 
