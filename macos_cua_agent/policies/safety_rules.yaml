@@ -7,6 +7,12 @@ blocked_bundle_ids:
 hitl_actions:
   - erase_disk
   - format_disk
+  - run_javascript  # Requires user approval for arbitrary code
+
+sensitive_domains:
+  - "chase.com"
+  - "aws.amazon.com"
+  - "console.cloud.google.com"
 
 allowed_shell_basenames:
   - ls

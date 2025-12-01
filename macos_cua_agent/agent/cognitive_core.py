@@ -198,13 +198,42 @@ BROWSER_TOOL = {
     "type": "function",
     "function": {
         "name": "browser",
-        "description": "Interact with web browsers (Safari/Chrome) semantically to read content and get links without OCR.",
+        "description": "Interact with web browsers (Safari/Chrome) semantically. Use this for reliable text entry, extracting structure, and executing logic.",
         "parameters": {
             "type": "object",
             "properties": {
-                "command": {"type": "string", "enum": ["get_page_content", "get_links", "navigate"]},
-                "app_name": {"type": "string", "description": "Safari or Google Chrome", "default": "Safari"},
-                "url": {"type": "string", "description": "URL to navigate to"}
+                "command": {
+                    "type": "string",
+                    "enum": [
+                        "get_page_content",
+                        "get_links",
+                        "navigate",
+                        "fill_form",
+                        "click_element",
+                        "get_dom_tree",
+                        "run_javascript",
+                        "go_back",
+                        "go_forward",
+                        "reload"
+                    ]
+                },
+                "app_name": {
+                    "type": "string",
+                    "description": "Safari or Google Chrome",
+                    "default": "Safari"
+                },
+                "url": {
+                    "type": "string",
+                    "description": "URL to navigate to (for 'navigate' command)"
+                },
+                "selector": {
+                    "type": "string",
+                    "description": "CSS selector for targeting elements. Required for fill_form and click_element. (e.g., '#search-box', 'input[name=\"q\"]')"
+                },
+                "value": {
+                    "type": "string",
+                    "description": "Content to type for fill_form, or raw JavaScript code for run_javascript."
+                }
             },
             "required": ["command"]
         }
@@ -653,6 +682,8 @@ class CognitiveCore:
             "command": args.get("command"),
             "app_name": args.get("app_name", "Safari"),
             "url": args.get("url"),
+            "selector": args.get("selector"),
+            "value": args.get("value"),
             "execution": "browser"
         }
 

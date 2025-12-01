@@ -4,6 +4,7 @@ import os
 import shlex
 import shutil
 from dataclasses import dataclass
+from urllib.parse import urlparse
 from typing import Any, Dict, List
 
 from macos_cua_agent.utils.config import Settings
@@ -12,7 +13,8 @@ from macos_cua_agent.utils.logger import get_logger
 DEFAULT_RULES = {
     "blocked_actions": ["shell_command"],
     "blocked_bundle_ids": ["com.apple.keychainaccess"],
-    "hitl_actions": ["erase_disk", "format_disk"],
+    "hitl_actions": ["erase_disk", "format_disk", "run_javascript"],
+    "sensitive_domains": [],
     "allowed_shell_basenames": [], # Deprecated but kept for compatibility
     "blocked_shell_basenames": [], # Deprecated
     "exclusion_zones": [], # List of {x, y, w, h, label}
@@ -73,9 +75,32 @@ class PolicyEngine:
     def evaluate(self, action: Dict[str, Any]) -> PolicyDecision:
         action_type = action.get("type") or action.get("action")
         bundle_id = action.get("bundle_id") or action.get("app")
+        command = action.get("command")
+        code_payload = action.get("value") or ""
+        page_url = action.get("page_url") or action.get("url") or ""
 
         if action_type in self.rules.get("blocked_actions", []):
             return PolicyDecision(allowed=False, reason=f"action blocked: {action_type}")
+        if command and command in self.rules.get("blocked_actions", []):
+            return PolicyDecision(allowed=False, reason=f"command blocked: {command}")
+
+        # Browser safety: block JS on sensitive domains and flag risky payloads
+        if action_type == "browser_op" and command == "run_javascript":
+            host = self._extract_hostname(page_url)
+            for domain in self.rules.get("sensitive_domains", []):
+                if host == domain or (domain and host.endswith(f".{domain}")):
+                    return PolicyDecision(
+                        allowed=False,
+                        reason=f"run_javascript blocked on sensitive domain: {host or 'unknown'}",
+                    )
+
+            risky = self._contains_dangerous_js(code_payload)
+            if risky:
+                return PolicyDecision(
+                    allowed=True,
+                    hitl_required=True,
+                    reason=f"run_javascript requires confirmation (risky pattern: {risky})",
+                )
             
         # Spatial Exclusion Check
         x = action.get("x")
@@ -131,9 +156,42 @@ class PolicyEngine:
                     subcommand = argv[1]
                     if not subcommand.startswith("-") and subcommand not in allowed_args:
                          return PolicyDecision(False, f"subcommand not allowed: {subcommand}")
-        
+
         if bundle_id and bundle_id in self.rules.get("blocked_bundle_ids", []):
             return PolicyDecision(allowed=False, reason=f"bundle blocked: {bundle_id}")
         if action_type in self.rules.get("hitl_actions", []):
             return PolicyDecision(allowed=True, hitl_required=True, reason="human confirmation required")
+        if command and command in self.rules.get("hitl_actions", []):
+            return PolicyDecision(allowed=True, hitl_required=True, reason="human confirmation required")
         return PolicyDecision(allowed=True)
+
+    def _extract_hostname(self, url: str) -> str:
+        if not url:
+            return ""
+        parsed = urlparse(url)
+        return parsed.hostname or ""
+
+    def _contains_dangerous_js(self, code: str) -> str:
+        """
+        Lightweight keyword scan to surface risky JS usage for HitL.
+        Returns the matched keyword when found, else empty string.
+        """
+        if not code:
+            return ""
+        lower = code.lower()
+        keywords = [
+            "fetch(",
+            "xmlhttprequest",
+            "ws://",
+            "wss://",
+            "document.cookie",
+            "localstorage",
+            "sessionstorage",
+            "indexeddb",
+            "eval(",
+            "Function(",
+        ]
+        for kw in keywords:
+            if kw in lower:
+                return kw.strip("()")
+        return ""

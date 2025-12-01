@@ -1,9 +1,12 @@
 import unittest
 import tempfile
+import os
+import subprocess
 from unittest.mock import MagicMock, patch
 from macos_cua_agent.agent.cognitive_core import CognitiveCore
-from macos_cua_agent.agent.state_manager import ActionResult
+from macos_cua_agent.agent.state_manager import ActionResult, StateManager
 from macos_cua_agent.drivers.action_engine import ActionEngine
+from macos_cua_agent.drivers.browser_driver import BrowserDriver
 from macos_cua_agent.memory.memory_manager import MemoryManager
 from macos_cua_agent.policies.policy_engine import PolicyEngine, PolicyDecision
 from macos_cua_agent.utils.config import Settings
@@ -168,6 +171,65 @@ class TestExtensions(unittest.TestCase):
         # Blocked drag end
         blocked_drag_end = self.policy.evaluate({"type": "drag_and_drop", "x": 200, "y": 200, "target_x": 50, "target_y": 50})
         self.assertFalse(blocked_drag_end.allowed)
+
+    def test_policy_run_javascript_requires_hitl(self):
+        with tempfile.NamedTemporaryFile("w", delete=False) as tmp:
+            tmp.write("hitl_actions:\n  - run_javascript\n")
+            tmp.flush()
+            rules_path = tmp.name
+        try:
+            policy = PolicyEngine(rules_path, self.settings)
+            decision = policy.evaluate({"type": "browser_op", "command": "run_javascript"})
+            self.assertTrue(decision.allowed)
+            self.assertTrue(decision.hitl_required)
+        finally:
+            os.remove(rules_path)
+
+    def test_default_policy_run_javascript_hitl(self):
+        policy = PolicyEngine("nonexistent_rules.yaml", self.settings)
+        decision = policy.evaluate({"type": "browser_op", "command": "run_javascript"})
+        self.assertTrue(decision.allowed)
+        self.assertTrue(decision.hitl_required)
+
+    def test_browser_shadow_dom_payload(self):
+        driver = BrowserDriver(self.settings)
+        with patch.object(driver, "_run_js_with_result", return_value=ActionResult(True, "ok")) as mock_run:
+            driver._get_dom_tree("Safari")
+            called_js = mock_run.call_args[0][1]
+            # Ensure shadow DOM traversal is present in payload
+            self.assertIn("shadowRoot", called_js)
+            self.assertIn("#shadow-root", called_js)
+
+    def test_browser_run_js_promise_wait_wrapper(self):
+        driver = BrowserDriver(self.settings)
+        with patch.object(driver, "_run_js_with_result", return_value=ActionResult(True, "ok")) as mock_run:
+            driver._run_arbitrary_js("Safari", "return Promise.resolve(1);")
+            called_js = mock_run.call_args[0][1]
+            # Promise wait logic should be embedded to avoid missing-value returns
+            self.assertIn("Promise unresolved", called_js)
+            self.assertIn("runner.then", called_js)
+
+    def test_browser_result_added_to_history(self):
+        state = StateManager()
+        action = {"type": "browser_op", "execution": "browser", "command": "get_page_content"}
+        result = ActionResult(success=True, reason="ok", metadata={"data": {"status": "success", "result": "Hello Web"}})
+
+        state.record_action(action, result)
+
+        browser_entries = [h for h in state.history if h.startswith("browser_result")]
+        self.assertEqual(len(browser_entries), 1)
+        self.assertIn("get_page_content", browser_entries[0])
+        self.assertIn("Hello Web", browser_entries[0])
+
+    @patch("macos_cua_agent.drivers.browser_driver.subprocess.run")
+    def test_applescript_timeout_is_handled(self, mock_run):
+        mock_run.side_effect = subprocess.TimeoutExpired(cmd=["osascript"], timeout=0.1)
+        driver = BrowserDriver(self.settings)
+
+        result = driver._run_arg_applescript("Safari", "return \"ok\"", [], "timeout_test", timeout=0.1)
+
+        self.assertFalse(result.success)
+        self.assertIn("timed out", result.reason)
 
 if __name__ == '__main__':
     unittest.main()

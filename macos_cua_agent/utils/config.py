@@ -56,6 +56,10 @@ class Settings:
     shell_max_output_bytes: int = int(os.getenv("SHELL_MAX_OUTPUT_BYTES", "65536"))
     shell_allowed_commands: str = os.getenv("SHELL_ALLOWED_COMMANDS", "")
 
+    # Browser/AppleScript safety
+    browser_script_timeout_s: float = float(os.getenv("BROWSER_SCRIPT_TIMEOUT_S", "8"))
+    browser_navigation_timeout_s: float = float(os.getenv("BROWSER_NAVIGATION_TIMEOUT_S", "12"))
+
     # Reasoning Tokens Configuration
     reasoning_effort: str | None = os.getenv("REASONING_EFFORT")  # high, medium, low
     reasoning_max_tokens: int | None = (

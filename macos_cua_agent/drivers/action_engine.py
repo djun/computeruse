@@ -33,6 +33,7 @@ class ActionEngine:
         self.logger = get_logger(__name__, level=settings.log_level)
 
     def execute(self, action: dict) -> ActionResult:
+        action = self._enrich_action(action)
         decision = self.policy_engine.evaluate(action)
         if not decision.allowed:
             self.logger.warning("Action blocked by policy: %s", decision.reason)
@@ -81,6 +82,21 @@ class ActionEngine:
 
         self.logger.info("Action result: success=%s reason=%s", result.success, result.reason)
         return result
+
+    def _enrich_action(self, action: dict) -> dict:
+        """
+        Adds contextual fields needed for safety checks (e.g., current URL for browser ops).
+        """
+        if action.get("execution") == "browser" and action.get("command") == "run_javascript":
+            try:
+                page_url = self.browser_driver.get_current_url(action.get("app_name", "Safari"))
+                if page_url:
+                    action = dict(action)
+                    action["page_url"] = page_url
+            except Exception:
+                # Non-fatal: if we can't retrieve the URL, proceed without it
+                pass
+        return action
 
     def _handle_clipboard(self, action: dict) -> ActionResult:
         sub = action.get("sub_action")

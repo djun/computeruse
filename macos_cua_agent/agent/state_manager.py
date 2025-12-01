@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -117,6 +118,9 @@ class StateManager:
             "execution": action.get("execution"),
         }
         self.history.append(f"action:{action_summary}")
+        browser_summary = self._summarize_browser_result(action, result)
+        if browser_summary:
+            self.history.append(browser_summary)
         self.steps += 1
         if not result.success and result.reason != "hotkey deduped":
             self.failure_count += 1
@@ -144,3 +148,35 @@ class StateManager:
             "runtime_seconds": time.time() - self.started_at,
             "stuck_reasons": list(self.stuck_reasons),
         }
+
+    def _summarize_browser_result(self, action: Dict[str, Any], result: ActionResult) -> str:
+        """
+        Push browser tool outputs into history so the LLM can read them on the next turn.
+        Truncates large payloads to protect the prompt budget.
+        """
+        if action.get("execution") != "browser":
+            return ""
+
+        metadata = result.metadata or {}
+        payload: Any = metadata.get("data")
+        if payload is None:
+            payload = metadata.get("raw") or metadata.get("output")
+
+        # Unwrap common {"result": ...} structure from BrowserDriver
+        if isinstance(payload, dict) and "result" in payload:
+            payload = payload.get("result")
+
+        if payload is None:
+            return ""
+
+        try:
+            text = payload if isinstance(payload, str) else json.dumps(payload, default=str)
+        except Exception:
+            text = str(payload)
+
+        max_len = 1200
+        if len(text) > max_len:
+            text = text[:max_len] + "... [truncated]"
+
+        cmd = action.get("command") or action.get("type") or "browser_result"
+        return f"browser_result:{cmd}:{text}"
