@@ -43,7 +43,7 @@ class TestArchitecture(unittest.TestCase):
 
     @patch('macos_cua_agent.orchestrator.reflection.Reflector._build_client')
     def test_reflector_structured_response(self, mock_build):
-        """Verify Reflector returns structured result."""
+        """Verify Reflector returns structured result and uses correct schema params."""
         mock_client = MagicMock()
         mock_build.return_value = mock_client
         
@@ -68,6 +68,13 @@ class TestArchitecture(unittest.TestCase):
         self.assertEqual(result.status, "failed")
         self.assertEqual(result.failure_type, "visual_mismatch")
         self.assertEqual(result.reason, "Button not found")
+
+        # Verify the call arguments for structured output
+        call_kwargs = mock_client.chat.completions.create.call_args[1]
+        self.assertIn("response_format", call_kwargs)
+        self.assertEqual(call_kwargs["response_format"]["type"], "json_schema")
+        self.assertEqual(call_kwargs["response_format"]["json_schema"]["name"], "reflection_result")
+        self.assertTrue(call_kwargs["response_format"]["json_schema"]["strict"])
 
 if __name__ == '__main__':
     unittest.main()

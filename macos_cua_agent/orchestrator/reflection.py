@@ -56,11 +56,7 @@ class Reflector:
             "You are a visual verifier for a desktop agent. Given the current sub-step, "
             "recent history, and a screenshot, evaluate the progress.\n"
             "Step: {desc}\nSuccess criteria: {criteria}\n{expected_text}\n"
-            "Respond in JSON format with:\n"
-            "- is_complete (bool): true if strictly satisfied.\n"
-            "- status (str): 'success', 'incomplete', or 'failed' (if clearly blocked or erroneous).\n"
-            "- failure_type (str): REQUIRED if failed. Values: 'visual_mismatch', 'blocked_by_popup', 'no_change', 'error_message', 'wrong_app'. Empty if success.\n"
-            "- reason (str): concise explanation."
+            "Analyze the screenshot and history to determine if the step is complete."
         ).format(desc=step.description, criteria=step.success_criteria, expected_text=expected_text)
 
         content = [
@@ -72,11 +68,42 @@ class Reflector:
             response = self.client.chat.completions.create(
                 model=self.settings.reflector_model,
                 messages=[
-                    {"role": "system", "content": "Return only valid JSON."},
+                    {"role": "system", "content": "You are a helpful assistant that evaluates task progress."},
                     {"role": "user", "content": content},
                 ],
                 max_tokens=1000,
-                response_format={"type": "json_object"},
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "reflection_result",
+                        "strict": True,
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "is_complete": {
+                                    "type": "boolean",
+                                    "description": "True if the step is strictly satisfied."
+                                },
+                                "status": {
+                                    "type": "string",
+                                    "enum": ["success", "incomplete", "failed"],
+                                    "description": "The status of the step."
+                                },
+                                "failure_type": {
+                                    "type": "string",
+                                    "enum": ["visual_mismatch", "blocked_by_popup", "no_change", "error_message", "wrong_app", ""],
+                                    "description": "The type of failure if status is 'failed'. Empty string if success."
+                                },
+                                "reason": {
+                                    "type": "string",
+                                    "description": "Concise explanation."
+                                }
+                            },
+                            "required": ["is_complete", "status", "failure_type", "reason"],
+                            "additionalProperties": False
+                        }
+                    }
+                },
             )
             raw = response.choices[0].message.content if response and response.choices else "{}"
             import json
