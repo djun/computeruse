@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
 import platform
+import re
 
 from macos_cua_agent.agent.state_manager import ActionResult
 from macos_cua_agent.utils.config import Settings
@@ -13,6 +14,7 @@ try:
     from ApplicationServices import (
         AXUIElementCreateSystemWide,
         AXUIElementCopyAttributeValue,
+        AXUIElementCopyAttributeNames,
         AXUIElementCopyElementAtPosition,
         AXUIElementPerformAction,
         AXUIElementCopyActionNames,
@@ -29,11 +31,19 @@ try:
         kAXSubroleAttribute,
         kAXRoleDescriptionAttribute,
         AXUIElementSetAttributeValue,
+        AXValueGetType,
+        AXValueGetValue,
+        kAXValueCGPointType,
+        kAXValueCGSizeType,
     )
+    from Quartz import CGPoint, CGSize
     from CoreFoundation import CFArrayGetCount, CFArrayGetValueAtIndex
     HAS_AX = True
 except ImportError:
     HAS_AX = False
+
+_AX_POINT_RE = re.compile(r"x:(-?\d+(?:\.\d+)?)\s+y:(-?\d+(?:\.\d+)?)")
+_AX_SIZE_RE = re.compile(r"w:(-?\d+(?:\.\d+)?)\s+h:(-?\d+(?:\.\d+)?)")
 
 
 class AccessibilityDriver:
@@ -112,14 +122,25 @@ class AccessibilityDriver:
                 return ActionResult(success=False, reason="No focused window found")
 
             # Build tree
+            # print("Start window print")
+            # self._debug_dump_ax_element(window)
+            # print("End window print")
             tree = self._build_tree(window, depth=0, max_depth=max_depth)
             if not self._tree_has_frame(tree):
                 reason = (
                     "Accessibility tree returned without usable frames (w/h <= 0). "
-                    "Grant Accessibility permission to this app in System Settings > Privacy & Security > Accessibility, "
-                    "then restart and retry."
+                    "This can be caused by missing Accessibility permissions or failing to decode AXPosition/AXSize; "
+                    "see log for captured raw frames."
                 )
-                self.logger.error(reason)
+                frames = self._collect_frames_for_logging(tree)
+                frames_to_log = frames[:20]
+                self.logger.error(
+                    "%s Frames captured (count=%d, showing up to %d): %s",
+                    reason,
+                    len(frames),
+                    len(frames_to_log),
+                    frames_to_log if frames_to_log else "none",
+                )
                 return ActionResult(success=False, reason=reason)
             return ActionResult(success=True, reason="captured", metadata={"tree": tree})
 
@@ -240,23 +261,29 @@ class AccessibilityDriver:
         size = self._get_attr(element, kAXSizeAttribute)
         
         frame = None
+        raw_frame = None
         if pos is not None and size is not None:
-            try:
-                # Handle pyobjc struct wrappers (CGPoint/CGSize) or tuples
-                x = getattr(pos, 'x', pos[0] if hasattr(pos, '__getitem__') else 0)
-                y = getattr(pos, 'y', pos[1] if hasattr(pos, '__getitem__') else 0)
-                w = getattr(size, 'width', size[0] if hasattr(size, '__getitem__') else 0)
-                h = getattr(size, 'height', size[1] if hasattr(size, '__getitem__') else 0)
-                
-                # Validation: Ensure reasonable values (e.g., not 0x0 unless it's truly hidden/empty)
-                # But some elements might be 0x0. However, for the agent, 0x0 is useless.
-                if w > 0 and h > 0:
-                    frame = {'x': x, 'y': y, 'w': w, 'h': h}
-            except Exception as e:
-                 self.logger.debug("Failed to parse frame for element role %s: %s", node["role"], e)
-                 frame = None
+            x, y = self._decode_point(pos)
+            w, h = self._decode_size(size)
+
+            raw_frame = {'x': x, 'y': y, 'w': w, 'h': h}
+            # Validation: Ensure reasonable values (e.g., not 0x0 unless it's truly hidden/empty)
+            # But some elements might be 0x0. However, for the agent, 0x0 is useless.
+            if w > 0 and h > 0:
+                frame = raw_frame
+            else:
+                self.logger.debug(
+                    "Parsed unusable frame (%s) from pos=%r size=%r for role=%s title=%s",
+                    raw_frame,
+                    pos,
+                    size,
+                    node.get("role"),
+                    node.get("title"),
+                )
         
         node["frame"] = frame
+        if raw_frame and frame is None:
+            node["raw_frame"] = raw_frame
         
         # Pruning: Skip uninteresting elements if they have no useful content
         # (This is a heuristic to save tokens)
@@ -288,6 +315,81 @@ class AccessibilityDriver:
 
         return node
 
+    def _decode_point(self, value: Any) -> Tuple[float, float]:
+        """Decode AX position into a numeric (x, y). Handles AXValue, structs, tuples, and repr fallback."""
+        try:
+            if value is None:
+                return 0.0, 0.0
+
+            # Tuple/list or CGPoint-like object
+            if hasattr(value, "x") and hasattr(value, "y"):
+                try:
+                    return float(value.x), float(value.y)
+                except Exception:
+                    pass
+            if hasattr(value, "__getitem__"):
+                try:
+                    return float(value[0]), float(value[1])
+                except Exception:
+                    pass
+
+            # AXValue wrapper
+            try:
+                ax_type = AXValueGetType(value)
+            except Exception:
+                ax_type = None
+            if ax_type == kAXValueCGPointType:
+                pt = CGPoint()
+                try:
+                    if AXValueGetValue(value, ax_type, pt):
+                        return float(pt.x), float(pt.y)
+                except Exception as exc:
+                    self.logger.debug("AXValue point decode failed: %s", exc)
+
+            # Last-resort repr parse (handles plain AXValue repr from some PyObjC versions)
+            match = _AX_POINT_RE.search(repr(value))
+            if match:
+                return float(match.group(1)), float(match.group(2))
+        except Exception as exc:
+            self.logger.debug("Failed to decode point %r: %s", value, exc)
+        return 0.0, 0.0
+
+    def _decode_size(self, value: Any) -> Tuple[float, float]:
+        """Decode AX size into numeric (w, h). Handles AXValue, structs, tuples, and repr fallback."""
+        try:
+            if value is None:
+                return 0.0, 0.0
+
+            if hasattr(value, "width") and hasattr(value, "height"):
+                try:
+                    return float(value.width), float(value.height)
+                except Exception:
+                    pass
+            if hasattr(value, "__getitem__"):
+                try:
+                    return float(value[0]), float(value[1])
+                except Exception:
+                    pass
+
+            try:
+                ax_type = AXValueGetType(value)
+            except Exception:
+                ax_type = None
+            if ax_type == kAXValueCGSizeType:
+                sz = CGSize()
+                try:
+                    if AXValueGetValue(value, ax_type, sz):
+                        return float(sz.width), float(sz.height)
+                except Exception as exc:
+                    self.logger.debug("AXValue size decode failed: %s", exc)
+
+            match = _AX_SIZE_RE.search(repr(value))
+            if match:
+                return float(match.group(1)), float(match.group(2))
+        except Exception as exc:
+            self.logger.debug("Failed to decode size %r: %s", value, exc)
+        return 0.0, 0.0
+
     def _get_attr(self, element: Any, attr_name: str) -> Any:
         try:
             err, value = AXUIElementCopyAttributeValue(element, attr_name, None)
@@ -297,6 +399,27 @@ class AccessibilityDriver:
         except Exception:
             pass
         return None
+
+    def _debug_dump_ax_element(self, element: Any) -> None:
+        """Print available AX attributes for a raw AXUIElement (debug helper)."""
+        try:
+            err, attr_names = AXUIElementCopyAttributeNames(element, None)
+            if err != 0 or not attr_names:
+                print(f"  <failed to fetch attribute names: err={err}>")
+                return
+
+            for name in attr_names:
+                err, value = AXUIElementCopyAttributeValue(element, name, None)
+                if name == kAXChildrenAttribute and err == 0:
+                    # Avoid dumping the full child tree; just show the count.
+                    summary = f"{len(value)} children" if isinstance(value, (list, tuple)) else str(value)
+                    print(f"  {name}: {summary}")
+                    continue
+
+                display = value if err == 0 else f"<err {err}>"
+                print(f"  {name}: {display}")
+        except Exception as exc:
+            print(f"  <debug dump failed: {exc}>")
 
     def _set_value_on_element_or_parents(self, element: Any, value: str, max_ancestors: int = 3) -> ActionResult | None:
         """Try setting kAXValueAttribute on the element, walking up to parents."""
@@ -344,3 +467,24 @@ class AccessibilityDriver:
             if self._tree_has_frame(child):
                 return True
         return False
+
+    def _collect_frames_for_logging(self, node: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Collect frames (including unusable ones) for debug logging."""
+        frames: List[Dict[str, Any]] = []
+        if not node:
+            return frames
+
+        frame = node.get("frame")
+        raw_frame = node.get("raw_frame")
+        if frame is not None:
+            frames.append(
+                {"role": node.get("role"), "title": node.get("title"), "frame": frame, "usable": True}
+            )
+        elif raw_frame is not None:
+            frames.append(
+                {"role": node.get("role"), "title": node.get("title"), "frame": raw_frame, "usable": False}
+            )
+
+        for child in node.get("children") or []:
+            frames.extend(self._collect_frames_for_logging(child))
+        return frames

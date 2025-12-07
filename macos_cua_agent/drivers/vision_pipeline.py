@@ -198,7 +198,7 @@ class VisionPipeline:
                 mask = edges > 0.04
 
                 # Close gaps to form solid shapes
-                closed = morphology.closing(mask, morphology.square(3))
+                closed = morphology.closing(mask, morphology.footprint_rectangle((3, 3)))
 
                 # Label regions
                 labels = measure.label(closed)

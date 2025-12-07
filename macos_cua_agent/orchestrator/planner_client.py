@@ -18,6 +18,53 @@ class PlannerClient:
         self.logger = get_logger(__name__, level=settings.log_level)
         self.client = self._build_client()
 
+    def _plan_json_schema(self) -> Dict[str, Any]:
+        """JSON schema for structured plan outputs."""
+        return {
+            "name": "desktop_plan",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "Plan identifier"},
+                    "user_prompt": {"type": "string"},
+                    "current_step_index": {"type": "integer"},
+                    "steps": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "integer"},
+                                "description": {"type": "string"},
+                                "success_criteria": {"type": "string"},
+                                "status": {
+                                    "type": "string",
+                                    "enum": ["pending", "in_progress", "done", "failed"],
+                                },
+                                "notes": {"type": "string", "default": ""},
+                                "expected_state": {"type": "string", "default": ""},
+                                "recovery_steps": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "default": [],
+                                },
+                                "sub_steps": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "default": [],
+                                },
+                            },
+                            "required": ["id", "description", "success_criteria", "status"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                "required": ["id", "user_prompt", "steps", "current_step_index"],
+                "additionalProperties": False,
+            },
+        }
+
     def _build_client(self) -> Optional[Any]:
         try:
             from openai import OpenAI  # type: ignore
@@ -80,9 +127,12 @@ class PlannerClient:
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_content},
                 ],
+                response_format={"type": "json_schema", "json_schema": self._plan_json_schema()},
+                extra_body={"structured_outputs": {"type": "json_schema", "json_schema": self._plan_json_schema()}},
             )
-            content = response.choices[0].message.content if response and response.choices else "{}"
-            plan_dict = self._parse_plan_response(content, plan_id, user_prompt)
+            message = response.choices[0].message if response and response.choices else None
+            content = message.content if message else "{}"
+            plan_dict = self._parse_plan_response(message or content, plan_id, user_prompt)
             return Plan.from_dict(plan_dict)
         except Exception as exc:  # pragma: no cover - defensive path
             self.logger.warning("Planner call failed; using fallback plan: %s", exc)
@@ -132,37 +182,67 @@ class PlannerClient:
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_content},
                 ],
+                response_format={"type": "json_schema", "json_schema": self._plan_json_schema()},
+                extra_body={"structured_outputs": {"type": "json_schema", "json_schema": self._plan_json_schema()}},
             )
-            content = response.choices[0].message.content if response and response.choices else "{}"
-            plan_dict = self._parse_plan_response(content, plan.id, plan.user_prompt)
+            message = response.choices[0].message if response and response.choices else None
+            content = message.content if message else "{}"
+            plan_dict = self._parse_plan_response(message or content, plan.id, plan.user_prompt)
             return Plan.from_dict(plan_dict)
         except Exception as exc:  # pragma: no cover - defensive path
             self.logger.warning("Plan revision failed; keeping existing plan: %s", exc)
             return plan
 
     def _parse_plan_response(self, content: Any, plan_id: str, user_prompt: str) -> Dict[str, Any]:
-        if isinstance(content, list):
-            content = "".join([frag.text for frag in content if hasattr(frag, "text")])  # type: ignore
-        if not isinstance(content, str):
-            content = json.dumps(content or {})
-        
-        json_str = content
-        if "PLAN_JSON:" in content:
-            parts = content.split("PLAN_JSON:", 1)
-            if len(parts) > 1:
-                json_str = parts[1].strip()
+        # Structured output path
+        parsed = getattr(content, "parsed", None)
+        if parsed:
+            if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
+                parsed = parsed[0]
+            if isinstance(parsed, dict):
+                data = parsed
+            else:
+                data = {}
         else:
-            # Fallback: try to find the first brace
-            start = content.find("{")
-            end = content.rfind("}")
-            if start != -1 and end != -1:
-                json_str = content[start : end + 1]
+            raw_content = getattr(content, "content", content)
+            if isinstance(raw_content, list):
+                # Attempt to stitch together parts from content fragments
+                part_texts = []
+                json_candidates = []
+                for frag in raw_content:
+                    if isinstance(frag, dict):
+                        if "json" in frag and isinstance(frag["json"], dict):
+                            json_candidates.append(frag["json"])
+                        elif "text" in frag:
+                            part_texts.append(str(frag["text"]))
+                    elif hasattr(frag, "text"):
+                        part_texts.append(str(frag.text))  # type: ignore
+                if json_candidates:
+                    data = json_candidates[0]
+                else:
+                    raw_content = "".join(part_texts)
 
-        try:
-            data = json.loads(json_str)
-        except Exception:
-            self.logger.warning("Failed to parse plan JSON from content: %s", content[:200])
-            data = {}
+            if not isinstance(raw_content, str):
+                raw_content = json.dumps(raw_content or {})
+            
+            json_str = raw_content
+            if "PLAN_JSON:" in raw_content:
+                parts = raw_content.split("PLAN_JSON:", 1)
+                if len(parts) > 1:
+                    json_str = parts[1].strip()
+            else:
+                # Fallback: try to find the first brace
+                start = raw_content.find("{")
+                end = raw_content.rfind("}")
+                if start != -1 and end != -1:
+                    json_str = raw_content[start : end + 1]
+
+            try:
+                data = json.loads(json_str)
+            except Exception:
+                snippet = raw_content if isinstance(raw_content, str) else str(raw_content)
+                self.logger.warning("Failed to parse plan JSON from content: %s", snippet[:200])
+                data = {}
 
         raw_steps = data.get("steps") or []
         steps: List[Step] = []

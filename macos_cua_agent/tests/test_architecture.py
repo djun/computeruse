@@ -76,5 +76,54 @@ class TestArchitecture(unittest.TestCase):
         self.assertEqual(call_kwargs["response_format"]["json_schema"]["name"], "reflection_result")
         self.assertTrue(call_kwargs["response_format"]["json_schema"]["strict"])
 
+    @patch('macos_cua_agent.orchestrator.planner_client.PlannerClient._build_client')
+    def test_planner_uses_structured_outputs(self, mock_build):
+        """Planner should request structured JSON responses."""
+        mock_client = MagicMock()
+        mock_build.return_value = mock_client
+
+        planner = PlannerClient(self.settings)
+        planner.client = mock_client
+
+        message = MagicMock()
+        message.parsed = {
+            "id": "plan_123",
+            "user_prompt": "do something",
+            "steps": [
+                {"id": 0, "description": "Step 1", "success_criteria": "Seen", "status": "pending"}
+            ],
+            "current_step_index": 0,
+        }
+        message.content = message.parsed
+        fake_response = MagicMock()
+        fake_response.choices = [MagicMock(message=message)]
+        mock_client.chat.completions.create.return_value = fake_response
+
+        planner.make_plan("do something")
+
+        call_kwargs = mock_client.chat.completions.create.call_args[1]
+        response_format = call_kwargs.get("response_format", {})
+        self.assertEqual(response_format.get("type"), "json_schema")
+        self.assertTrue(response_format.get("json_schema", {}).get("strict"))
+        self.assertIn("structured_outputs", call_kwargs.get("extra_body", {}))
+
+    def test_parse_plan_response_uses_parsed_payload(self):
+        """Ensure parsed structured outputs are consumed directly."""
+        planner = PlannerClient(self.settings)
+        message = MagicMock()
+        message.parsed = {
+            "id": "plan_abc",
+            "user_prompt": "sample task",
+            "steps": [
+                {"id": 0, "description": "Step 0", "success_criteria": "Done", "status": "pending"}
+            ],
+            "current_step_index": 1,
+        }
+        message.content = message.parsed
+
+        parsed = planner._parse_plan_response(message, "fallback", "sample task")
+        self.assertEqual(parsed["id"], "plan_abc")
+        self.assertEqual(parsed["user_prompt"], "sample task")
+        self.assertEqual(parsed["current_step_index"], 1)
 if __name__ == '__main__':
     unittest.main()
