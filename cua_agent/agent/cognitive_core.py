@@ -198,7 +198,10 @@ BROWSER_TOOL = {
     "type": "function",
     "function": {
         "name": "browser",
-        "description": "Interact with web browsers (Safari/Chrome) semantically. Use this for reliable text entry, extracting structure, and executing logic.",
+        "description": (
+            "Interact with web browsers (Safari/Chrome). "
+            "On macOS this is AppleScript/JXA-based; on Windows it requires a Chromium browser launched with remote debugging (CDP)."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
@@ -325,6 +328,8 @@ class CognitiveCore:
         relevant_skills: Optional[List[Any]],
     ) -> Any:
         """Send a vision + tool-calling request to OpenRouter."""
+        windows_cyborg = self.platform_name.lower().startswith("windows") and self.settings.windows_cyborg_mode
+
         plan_text = "No structured plan; infer progress from the user's request."
         if plan and current_step:
             upcoming = [
@@ -381,10 +386,33 @@ class CognitiveCore:
                 + "\n".join(som_lines)
             )
 
+        browser_tool_line = (
+            "- `browser`: for high-speed reading/navigation of web pages."
+            if not windows_cyborg
+            else "- `browser`: CDP-based on Windows and may be unavailable; prefer `computer` for web automation."
+        )
+        browser_research_lines = (
+            "- For Research:\n"
+            "  1. Use `browser` tool to `get_links` or `get_page_content`.\n"
+            "  2. Read the content.\n"
+            "  3. SAVE key findings using `notebook` tool (`add_note`).\n"
+            "  4. This prevents data loss when context window fills up."
+            if not windows_cyborg
+            else "- For Research on Windows Cyborg mode:\n"
+            "  1. Prefer `inspect_ui` + the accessibility summary + screenshot grounding.\n"
+            "  2. If you must use `browser`, it may fail unless CDP is enabled; switch back to `computer` immediately on CDP errors.\n"
+            "  3. SAVE key findings using `notebook` (`add_note`)."
+        )
+        browser_preference_line = (
+            "- Prefer `browser` tools over `computer` OCR/Vision for text-heavy web tasks."
+            if not windows_cyborg
+            else "- Windows Cyborg mode: prefer `computer` + `inspect_ui` + HID/Phantom Mode; avoid `browser` unless CDP is confirmed working."
+        )
+
         system_prompt = f"""
             You are a cautious, focused {self.platform_name} desktop operator. You have a robust toolbox including:
             - `computer`: for low-level mouse/keyboard interaction and UI inspection (`inspect_ui`).
-            - `browser`: for high-speed reading and navigation of web pages (use this for research).
+            {browser_tool_line}
             - `notebook`: for saving facts and notes to persistent memory (use this to avoid forgetting things).
             - `shell`: for local workspace file operations.
 
@@ -403,11 +431,7 @@ class CognitiveCore:
             - Use `inspect_ui` if visual elements are ambiguous or you need to find hidden controls.
             - Coordinates: only provide x/y when no overlay tag is available. If using x/y, return logical display points (screenshot is already downscaled to logical resolution).
             - To reduce latency, prefer batching obvious sequences (e.g., click + type + enter) using `actions`.
-            - For Research:
-              1. Use `browser` tool to `get_links` or `get_page_content`.
-              2. Read the content.
-              3. SAVE key findings using `notebook` tool (`add_note`).
-              4. This prevents data loss when context window fills up.
+            {browser_research_lines}
 
             Environment
             - System: {self.system_info}
@@ -422,7 +446,7 @@ class CognitiveCore:
             
             Action Selection
             - Prefer batching obvious sequences using the `actions` array (macro_actions) to cut latency.
-            - Prefer `browser` tools over `computer` OCR/Vision for text-heavy web tasks.
+            {browser_preference_line}
             - Prefer `inspect_ui` over random guessing of coordinates.
             
             Recent events:
@@ -679,9 +703,32 @@ class CognitiveCore:
         }
 
     def _map_browser_args(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        cmd = args.get("command")
+        windows_cyborg = self.platform_name.lower().startswith("windows") and self.settings.windows_cyborg_mode
+        if windows_cyborg:
+            if cmd == "navigate":
+                url = (args.get("url") or "").strip()
+                if not url:
+                    return {"type": "capture_only", "reason": "browser.navigate missing url (Windows Cyborg mode)"}
+                return {
+                    "type": "macro_actions",
+                    "actions": [
+                        {"type": "key", "keys": ["ctrl", "l"]},
+                        {"type": "wait", "seconds": 0.15},
+                        {"type": "type", "text": url},
+                        {"type": "key", "keys": ["enter"]},
+                    ],
+                }
+            if cmd == "go_back":
+                return {"type": "key", "keys": ["alt", "left"]}
+            if cmd == "go_forward":
+                return {"type": "key", "keys": ["alt", "right"]}
+            if cmd == "reload":
+                return {"type": "key", "keys": ["ctrl", "r"]}
+
         return {
             "type": "browser_op",
-            "command": args.get("command"),
+            "command": cmd,
             "app_name": args.get("app_name", "Safari"),
             "url": args.get("url"),
             "selector": args.get("selector"),

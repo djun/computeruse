@@ -39,6 +39,31 @@ class TestExtensions(unittest.TestCase):
         # Create a PolicyEngine with a dummy rules file (will use defaults + overrides)
         self.policy = PolicyEngine("dummy_rules.yaml", self.settings)
 
+    def _make_engine(self) -> ActionEngine:
+        """
+        Build an ActionEngine without touching real macOS UI frameworks.
+
+        In some sandbox/CI environments, importing or calling AppKit/Quartz can abort the
+        interpreter. These tests only exercise ActionEngine routing logic, so we stub
+        out the OS-facing drivers.
+        """
+        dummy_display = DisplayInfo(
+            logical_width=1280,
+            logical_height=720,
+            physical_width=1280,
+            physical_height=720,
+            scale_factor=1.0,
+        )
+        with (
+            patch("macos_cua_agent.drivers.action_engine.get_display_info", return_value=dummy_display),
+            patch("macos_cua_agent.drivers.action_engine.HIDDriver", return_value=MagicMock()),
+            patch("macos_cua_agent.drivers.action_engine.SemanticDriver", return_value=MagicMock()),
+            patch("macos_cua_agent.drivers.action_engine.ShellDriver", return_value=MagicMock()),
+            patch("macos_cua_agent.drivers.action_engine.AccessibilityDriver", return_value=MagicMock()),
+            patch("macos_cua_agent.drivers.action_engine.BrowserDriver", return_value=MagicMock()),
+        ):
+            return ActionEngine(self.settings, self.policy)
+
     def test_map_drag_and_drop(self):
         args = {
             "action": "drag_and_drop",
@@ -123,7 +148,7 @@ class TestExtensions(unittest.TestCase):
         self.assertFalse(result["verify_after"])
     
     def test_phantom_mode_right_click_action_engine(self):
-        engine = ActionEngine(self.settings, self.policy)
+        engine = self._make_engine()
         engine.accessibility_driver.perform_action_at = MagicMock(return_value=ActionResult(True, "ax"))
         engine.hid_driver.right_click = MagicMock(return_value=ActionResult(True, "hid"))
         action = {"type": "right_click", "x": 5, "y": 5, "phantom_mode": True}
@@ -133,7 +158,7 @@ class TestExtensions(unittest.TestCase):
         engine.hid_driver.right_click.assert_not_called()
 
     def test_phantom_auto_with_element_id(self):
-        engine = ActionEngine(self.settings, self.policy)
+        engine = self._make_engine()
         engine.accessibility_driver.perform_action_at = MagicMock(return_value=ActionResult(True, "ax"))
         engine.hid_driver.left_click = MagicMock(return_value=ActionResult(True, "hid"))
 
@@ -147,7 +172,7 @@ class TestExtensions(unittest.TestCase):
     @patch("subprocess.check_output")
     def test_clipboard_redaction(self, mock_paste):
         mock_paste.return_value = b"AKIA" + b"1" * 16  # Looks like AWS access key -> should redact
-        engine = ActionEngine(self.settings, self.policy)
+        engine = self._make_engine()
 
         result = engine.execute({"type": "clipboard_op", "sub_action": "read"})
 

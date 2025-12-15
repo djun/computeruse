@@ -19,7 +19,7 @@ This repo is organized as a small multi-package workspace:
 - OpenRouter account/key to drive the planner, cognitive core, and reflector models; without a key the agent runs in noop/stub mode.
 
 **Run**
-- Windows: `python -m windows_cua_agent.main` (if `ENABLE_HID=true` and `WINDOWS_AUTO_ELEVATE=true`, the agent may request elevation via UAC; for browser ops, launch Chrome/Edge with `--remote-debugging-port=9222`)
+- Windows: `python -m windows_cua_agent.main` (if `ENABLE_HID=true` and `WINDOWS_AUTO_ELEVATE=true`, the agent may request elevation via UAC; `WINDOWS_CYBORG_MODE=true` avoids CDP and drives Chrome via UIA/HID; for full `browser` tool support, launch Chrome/Edge with `--remote-debugging-port=9222` on a non-default profile)
 - macOS: `python -m macos_cua_agent.main`
 - Core entrypoint (auto-selects adapter by OS, or override): `python -m cua_agent` (or `python -m cua_agent --adapter windows_cua_agent`)
 

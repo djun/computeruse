@@ -82,7 +82,25 @@ class ActionEngine:
             return self._run_macro_actions(action.get("actions") or [])
 
         if execution_path == "browser":
-            return self.browser_driver.execute_browser_action(action)
+            browser_result = self.browser_driver.execute_browser_action(action)
+            if browser_result.success:
+                return browser_result
+
+            if self.settings.windows_cyborg_mode and self._looks_like_cdp_unavailable(browser_result.reason):
+                fallback = self._cyborg_fallback_for_browser_action(action)
+                if fallback is not None:
+                    return fallback
+                # Non-actionable browser ops (DOM/JS) should be retried via computer tools.
+                return ActionResult(
+                    success=True,
+                    reason=(
+                        f"CDP unavailable; skipped browser.{action.get('command')} "
+                        "(use computer/inspect_ui + HID/Phantom Mode)"
+                    ),
+                    metadata={"cdp_unavailable": True, **(browser_result.metadata or {})},
+                )
+
+            return browser_result
         if execution_path == "semantic" and self.settings.enable_semantic:
             result = self.semantic_driver.execute(action)
         elif execution_path == "shell":
@@ -143,6 +161,76 @@ class ActionEngine:
                 pass
 
         return enriched
+
+    def _looks_like_cdp_unavailable(self, reason: str) -> bool:
+        """
+        Best-effort classifier for Chrome DevTools Protocol unavailability.
+
+        Chrome 136+ can refuse to expose the CDP listener for the default profile, which
+        surfaces as connection errors, empty /json listings, websocket upgrade failures,
+        or timeouts. In these cases we should degrade to "Cyborg" (UIA/HID/Vision) mode.
+        """
+        r = (reason or "").lower()
+        if not r:
+            return True
+
+        needles = [
+            "connection refused",
+            "connectex",
+            "actively refused",
+            "timed out",
+            "timeout waiting for",
+            "websocket upgrade failed",
+            "no response",
+            "socket closed",
+            "no page target found",
+            "cdp websocket not connected",
+            "urlopen error",
+            "failed to establish a new connection",
+        ]
+        return any(n in r for n in needles)
+
+    def _cyborg_fallback_for_browser_action(self, action: dict) -> ActionResult | None:
+        """
+        Convert certain browser ops into equivalent UI-level interactions.
+
+        This keeps Windows automation functional when CDP is blocked (e.g., Chrome 136+
+        default profile restrictions) by using the same interfaces a human uses.
+        """
+        cmd = (action.get("command") or "").strip()
+
+        if cmd == "navigate":
+            url = (action.get("url") or "").strip()
+            if not url:
+                return ActionResult(success=False, reason="navigate requires url")
+            macro = [
+                {"type": "key", "keys": ["ctrl", "l"]},
+                {"type": "wait", "seconds": 0.15},
+                {"type": "type", "text": url},
+                {"type": "key", "keys": ["enter"]},
+            ]
+            res = self._run_macro_actions(macro)
+            if res.success:
+                return ActionResult(success=True, reason="CDP unavailable; navigated via Cyborg macro", metadata=res.metadata)
+            return ActionResult(
+                success=False,
+                reason=f"CDP unavailable; Cyborg navigate macro failed: {res.reason}",
+                metadata=res.metadata,
+            )
+
+        if cmd in {"go_back", "go_forward", "reload"}:
+            if cmd == "go_back":
+                keys = ["alt", "left"]
+            elif cmd == "go_forward":
+                keys = ["alt", "right"]
+            else:
+                keys = ["ctrl", "r"]
+            res = self.execute({"type": "key", "keys": keys})
+            if res.success:
+                return ActionResult(success=True, reason=f"CDP unavailable; {cmd} via Cyborg hotkey")
+            return ActionResult(success=False, reason=f"CDP unavailable; {cmd} hotkey failed: {res.reason}")
+
+        return None
 
     def _handle_clipboard(self, action: dict) -> ActionResult:
         sub = action.get("sub_action")
@@ -440,4 +528,3 @@ class ActionEngine:
                 best = node
 
         return best if best_score > 0 else None
-

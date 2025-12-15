@@ -48,6 +48,7 @@ class Settings:
     enable_hid: bool = _get_bool("ENABLE_HID", False)
     enable_semantic: bool = _get_bool("ENABLE_SEMANTIC", True)
     enable_shell: bool = _get_bool("ENABLE_SHELL", False)
+    windows_cyborg_mode: bool = _get_bool("WINDOWS_CYBORG_MODE", True)
     windows_auto_elevate: bool = _get_bool("WINDOWS_AUTO_ELEVATE", True)
     use_openrouter: bool = _get_bool("USE_OPENROUTER", True)
     planner_use_openrouter: bool = use_openrouter
