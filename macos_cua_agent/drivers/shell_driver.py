@@ -5,9 +5,9 @@ import subprocess
 from pathlib import Path
 from typing import Optional
 
-from macos_cua_agent.agent.state_manager import ActionResult
-from macos_cua_agent.utils.config import Settings
-from macos_cua_agent.utils.logger import get_logger
+from cua_agent.agent.state_manager import ActionResult
+from cua_agent.utils.config import Settings
+from cua_agent.utils.logger import get_logger
 
 
 class ShellDriver:

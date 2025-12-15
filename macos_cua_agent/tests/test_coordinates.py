@@ -1,4 +1,4 @@
-from macos_cua_agent.utils.coordinates import clamp_point, point_to_px, px_to_point
+from cua_agent.utils.coordinates import clamp_point, point_to_px, px_to_point
 
 
 def test_px_to_point_round_trip():

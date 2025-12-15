@@ -5,6 +5,7 @@ Pillow>=10.0.0
 PyYAML>=6.0.0
 mss>=9.0.0
 pyautogui>=0.9.54
+comtypes>=1.4.0; platform_system=="Windows"
 pyobjc-core>=10.0; platform_system=="Darwin"
 pyobjc-framework-Cocoa>=10.0; platform_system=="Darwin"
 pyobjc-framework-Quartz>=10.0; platform_system=="Darwin"

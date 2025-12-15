@@ -1,6 +1,12 @@
 /project.md
 /.env
 /.idea
+/.venv
+/.pytest_cache
+/pytest-cache-files-*
+/tmp*
+__pycache__/
+*.py[cod]
 /*/.agent_memory
 /*/.agent_shell
 /.agent_shell/

@@ -1,3 +1,4 @@
+# Shared safety rules for the CUA core (applies across adapters).
 blocked_actions:
   - shell_command
 

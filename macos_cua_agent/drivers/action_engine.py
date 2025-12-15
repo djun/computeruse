@@ -5,16 +5,16 @@ import re
 import subprocess
 import time
 
-from macos_cua_agent.agent.state_manager import ActionResult
+from cua_agent.agent.state_manager import ActionResult
 from macos_cua_agent.drivers.accessibility_driver import AccessibilityDriver
 from macos_cua_agent.drivers.browser_driver import BrowserDriver
 from macos_cua_agent.drivers.hid_driver import HIDDriver
 from macos_cua_agent.drivers.semantic_driver import SemanticDriver
 from macos_cua_agent.drivers.shell_driver import ShellDriver
-from macos_cua_agent.policies.policy_engine import PolicyEngine
-from macos_cua_agent.utils.ax_utils import flatten_nodes_with_frames
-from macos_cua_agent.utils.config import Settings
-from macos_cua_agent.utils.logger import get_logger
+from cua_agent.policies.policy_engine import PolicyEngine
+from cua_agent.utils.ax_utils import flatten_nodes_with_frames
+from cua_agent.utils.config import Settings
+from cua_agent.utils.logger import get_logger
 from macos_cua_agent.utils.macos_integration import get_display_info
 
 

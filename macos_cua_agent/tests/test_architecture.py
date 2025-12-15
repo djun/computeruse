@@ -2,10 +2,10 @@ import json
 import unittest
 from unittest.mock import MagicMock, patch
 
-from macos_cua_agent.orchestrator.planning import Step, Plan
-from macos_cua_agent.orchestrator.planner_client import PlannerClient
-from macos_cua_agent.orchestrator.reflection import Reflector, ReflectionResult
-from macos_cua_agent.utils.config import Settings
+from cua_agent.orchestrator.planning import Step, Plan
+from cua_agent.orchestrator.planner_client import PlannerClient
+from cua_agent.orchestrator.reflection import Reflector, ReflectionResult
+from cua_agent.utils.config import Settings
 
 class TestArchitecture(unittest.TestCase):
     
@@ -41,7 +41,7 @@ class TestArchitecture(unittest.TestCase):
         self.assertEqual(len(plan.steps), 1)
         self.assertEqual(plan.steps[0].recovery_steps, ["Retry A", "Retry B"])
 
-    @patch('macos_cua_agent.orchestrator.reflection.Reflector._build_client')
+    @patch('cua_agent.orchestrator.reflection.Reflector._build_client')
     def test_reflector_structured_response(self, mock_build):
         """Verify Reflector returns structured result and uses correct schema params."""
         mock_client = MagicMock()
@@ -76,7 +76,7 @@ class TestArchitecture(unittest.TestCase):
         self.assertEqual(call_kwargs["response_format"]["json_schema"]["name"], "reflection_result")
         self.assertTrue(call_kwargs["response_format"]["json_schema"]["strict"])
 
-    @patch('macos_cua_agent.orchestrator.planner_client.PlannerClient._build_client')
+    @patch('cua_agent.orchestrator.planner_client.PlannerClient._build_client')
     def test_planner_uses_structured_outputs(self, mock_build):
         """Planner should request structured JSON responses."""
         mock_client = MagicMock()

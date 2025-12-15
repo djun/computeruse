@@ -2,21 +2,40 @@ import unittest
 import tempfile
 import os
 import subprocess
+import uuid
+from pathlib import Path
+import shutil
 from unittest.mock import MagicMock, patch
-from macos_cua_agent.agent.cognitive_core import CognitiveCore
-from macos_cua_agent.agent.state_manager import ActionResult, StateManager
+from cua_agent.agent.cognitive_core import CognitiveCore
+from cua_agent.agent.state_manager import ActionResult, StateManager
+from cua_agent.computer.types import DisplayInfo
 from macos_cua_agent.drivers.action_engine import ActionEngine
 from macos_cua_agent.drivers.browser_driver import BrowserDriver
-from macos_cua_agent.memory.memory_manager import MemoryManager
-from macos_cua_agent.policies.policy_engine import PolicyEngine, PolicyDecision
-from macos_cua_agent.utils.config import Settings
+from cua_agent.memory.memory_manager import MemoryManager
+from cua_agent.policies.policy_engine import PolicyEngine, PolicyDecision
+from cua_agent.utils.config import Settings
+
+
+class _DummyComputer:
+    platform_name = "test"
+    system_info = "test"
+    display = DisplayInfo(
+        logical_width=1280,
+        logical_height=720,
+        physical_width=1280,
+        physical_height=720,
+        scale_factor=1.0,
+    )
+
+    def run_health_checks(self, settings: Settings, logger=None) -> None:  # noqa: ARG002
+        return None
 
 class TestExtensions(unittest.TestCase):
 
     def setUp(self):
         self.settings = Settings()
         # Mocking dependencies for CognitiveCore if needed, but we are testing a pure method
-        self.core = CognitiveCore(self.settings)
+        self.core = CognitiveCore(self.settings, _DummyComputer())
         # Create a PolicyEngine with a dummy rules file (will use defaults + overrides)
         self.policy = PolicyEngine("dummy_rules.yaml", self.settings)
 
@@ -137,17 +156,21 @@ class TestExtensions(unittest.TestCase):
         self.assertEqual(result.metadata.get("content"), "<REDACTED>")
     
     def test_skill_store_dedup(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            settings = Settings(memory_root=tmp)
+        tmp_root = Path(os.getcwd()) / f".tmp_memory_{uuid.uuid4().hex}"
+        try:
+            tmp_root.mkdir(parents=True, exist_ok=False)
+            settings = Settings(memory_root=str(tmp_root))
             memory = MemoryManager(settings)
             actions = [{"type": "left_click", "x": 1, "y": 2}]
-            
+
             skill1 = memory.save_skill("click-once", "click action", actions)
             skill2 = memory.save_skill("click-repeat", "another desc", actions)
-            
+
             self.assertEqual(skill1.id, skill2.id)
             self.assertEqual(len(memory.list_skills()), 1)
             self.assertGreaterEqual(skill2.usage_count, 1)
+        finally:
+            shutil.rmtree(tmp_root, ignore_errors=True)
 
     def test_policy_exclusion_zone(self):
         # Inject a rule manually

@@ -13,9 +13,10 @@ try:
 except Exception:
     skimage_ssim = None
 
-from macos_cua_agent.utils.config import Settings
-from macos_cua_agent.utils.logger import get_logger
-from macos_cua_agent.utils.macos_integration import DisplayInfo, get_display_info
+from cua_agent.computer.types import DisplayInfo
+from cua_agent.utils.config import Settings
+from cua_agent.utils.logger import get_logger
+from macos_cua_agent.utils.macos_integration import get_display_info
 
 
 class VisionPipeline:

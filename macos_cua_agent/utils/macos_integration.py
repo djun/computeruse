@@ -1,20 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Optional
 
-from macos_cua_agent.utils.logger import get_logger
+from cua_agent.computer.types import DisplayInfo
+from cua_agent.utils.logger import get_logger
 
 logger = get_logger(__name__)
-
-
-@dataclass
-class DisplayInfo:
-    logical_width: int
-    logical_height: int
-    physical_width: int
-    physical_height: int
-    scale_factor: float
 
 
 def get_display_info() -> DisplayInfo:

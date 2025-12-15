@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 
-from macos_cua_agent.utils.logger import get_logger
+from cua_agent.utils.logger import get_logger
 from macos_cua_agent.utils.macos_integration import (
     has_accessibility_permission,
     has_screen_recording_permission,

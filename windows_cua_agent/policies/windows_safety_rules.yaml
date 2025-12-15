@@ -1,0 +1,53 @@
+# Windows-specific safety rules for the CUA agent.
+
+blocked_actions:
+  - shell_command
+
+# Windows adapter uses the `bundle_id` field to carry the active process image name (e.g., "taskmgr.exe").
+blocked_bundle_ids:
+  # System integrity / administrative tools
+  - taskmgr.exe
+  - mmc.exe
+  - regedit.exe
+  - msconfig.exe
+
+  # Identity / credentials
+  - credwiz.exe
+  - lsass.exe
+
+  # Installers (high risk without explicit user intent)
+  - msiexec.exe
+  - setup.exe
+
+hitl_actions:
+  - erase_disk
+  - format_disk
+  - run_javascript
+
+sensitive_domains:
+  - "chase.com"
+  - "aws.amazon.com"
+  - "console.cloud.google.com"
+
+allowed_shell_basenames:
+  - dir
+  - type
+  - copy
+  - move
+  - del
+  - Select-String
+  - Get-ChildItem
+  - Get-Content
+
+blocked_shell_basenames:
+  - curl
+  - wget
+  - Invoke-WebRequest
+  - Invoke-RestMethod
+
+exclusion_zones: []
+
+notes: |
+  This file overrides the core defaults for Windows.
+  Adjust allow/deny lists to match your risk appetite.
+

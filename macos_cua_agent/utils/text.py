@@ -1,10 +1,6 @@
 from __future__ import annotations
 
-import re
-from typing import Set
+from cua_agent.utils.text import tokenize_lower
 
+__all__ = ["tokenize_lower"]
 
-def tokenize_lower(text: str) -> Set[str]:
-    """Lightweight tokenizer for similarity scoring."""
-    tokens = re.findall(r"[a-z0-9]+", text.lower())
-    return set(tokens)
