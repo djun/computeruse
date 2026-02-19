@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from urllib.parse import urlparse
 
+from cua_agent.agent.state_manager import VERIFICATION_SENSOR_HIERARCHY
 from cua_agent.computer.adapter import ComputerAdapter
 from cua_agent.utils.config import Settings
 from cua_agent.utils.logger import get_logger
@@ -70,8 +72,36 @@ COMPUTER_TOOL = {
                             "content": {"type": "string"},
                             "phantom_mode": {"type": "boolean"},
                             "verify_after": {"type": "boolean"},
+                            "verification": {
+                                "type": "object",
+                                "description": (
+                                    "Post-action verification contract. "
+                                    "Prefer low-cost sensors before vision."
+                                ),
+                                "properties": {
+                                    "sensor": {
+                                        "type": "string",
+                                        "enum": ["none", "os_telemetry", "a11y_tree", "pixel_diff", "vision_full"],
+                                    },
+                                    "expected_state": {"type": "string"},
+                                    "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 30, "default": 5},
+                                },
+                                "required": ["sensor"],
+                                "additionalProperties": False,
+                            },
                             "skill_id": {"type": "string"},
                             "skill_name": {"type": "string"},
+                            "skill_args": {
+                                "type": "object",
+                                "description": "Runtime arguments for parameterized skills.",
+                                "additionalProperties": {
+                                    "anyOf": [{"type": "string"}, {"type": "number"}, {"type": "boolean"}]
+                                },
+                            },
+                            "rationale": {
+                                "type": "string",
+                                "description": "Short reason for this action choice (for debug observability).",
+                            },
                         },
                         "required": ["action"],
                         "additionalProperties": False,
@@ -136,6 +166,34 @@ COMPUTER_TOOL = {
                     "description": "If false, skip post-action verification delay and change-detection capture.",
                     "default": True,
                 },
+                "verification": {
+                    "type": "object",
+                    "description": (
+                        "Verification contract for this action block. "
+                        "Always choose the cheapest sensor that can prove success."
+                    ),
+                    "properties": {
+                        "sensor": {
+                            "type": "string",
+                            "enum": ["none", "os_telemetry", "a11y_tree", "pixel_diff", "vision_full"],
+                        },
+                        "expected_state": {
+                            "type": "string",
+                            "description": (
+                                "Concrete expected state, e.g. "
+                                "'text_exists:Dashboard', 'clipboard_changed', or 'file_exists:C:/tmp/out.pdf'."
+                            ),
+                        },
+                        "timeout_seconds": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 30,
+                            "default": 5,
+                        },
+                    },
+                    "required": ["sensor"],
+                    "additionalProperties": False,
+                },
                 "skill_id": {
                     "type": "string",
                     "description": "ID of a stored procedural skill to execute (run_skill).",
@@ -143,6 +201,17 @@ COMPUTER_TOOL = {
                 "skill_name": {
                     "type": "string",
                     "description": "Name of a stored procedural skill to execute (run_skill).",
+                },
+                "skill_args": {
+                    "type": "object",
+                    "description": "Runtime argument values for a parameterized stored skill.",
+                    "additionalProperties": {
+                        "anyOf": [{"type": "string"}, {"type": "number"}, {"type": "boolean"}]
+                    },
+                },
+                "rationale": {
+                    "type": "string",
+                    "description": "Short reason for choosing this action (for debug observability).",
                 },
             },
             "required": ["action"],
@@ -243,6 +312,8 @@ BROWSER_TOOL = {
     }
 }
 
+READ_ONLY_BROWSER_COMMANDS = {"get_page_content", "get_links", "get_dom_tree"}
+
 
 class CognitiveCore:
     """Calls Claude Opus 4.5 via OpenRouter with a custom computer tool."""
@@ -255,6 +326,26 @@ class CognitiveCore:
         self.system_info = computer.system_info
         self.platform_name = computer.platform_name
         self.client = self._build_client()
+        self._log_execution_profile_startup()
+
+    def _tool_enabled_map(self) -> Dict[str, bool]:
+        return {
+            "computer": self.settings.allows_gui_actions(),
+            "browser": self.settings.allows_browser_actions(),
+            "shell": self.settings.allows_shell_actions(),
+            "notebook": True,
+        }
+
+    def _log_execution_profile_startup(self) -> None:
+        status = self._tool_enabled_map()
+        enabled = [name for name, allowed in status.items() if allowed]
+        disabled = [name for name, allowed in status.items() if not allowed]
+        self.logger.info(
+            "Execution profile '%s' active. Tools enabled: [%s]. Tools disabled: [%s].",
+            self.settings.execution_profile,
+            ", ".join(enabled) if enabled else "none",
+            ", ".join(disabled) if disabled else "none",
+        )
 
     def _build_client(self) -> Optional[Any]:
         if not self.settings.use_openrouter:
@@ -276,6 +367,7 @@ class CognitiveCore:
         self,
         observation_b64: str,
         history: List[str],
+        include_visual_context: bool = True,
         user_prompt: Optional[str] = None,
         repeat_info: Optional[Dict[str, Any]] = None,
         plan: Optional["Plan"] = None,
@@ -297,6 +389,7 @@ class CognitiveCore:
             response = self._call_openrouter(
                 observation_b64,
                 history,
+                include_visual_context=include_visual_context,
                 user_prompt=user_prompt,
                 repeat_info=repeat_info,
                 plan=plan,
@@ -308,7 +401,14 @@ class CognitiveCore:
             )
             parsed_action = self._parse_tool_call(response)
             if parsed_action:
-                return parsed_action
+                model_text = self._extract_response_text(response)
+                return self._annotate_with_debug_trace(
+                    parsed_action,
+                    model_text=model_text,
+                    current_step=current_step,
+                    loop_state=loop_state,
+                    repeat_info=repeat_info,
+                )
         except Exception as exc:  # pragma: no cover - defensive fallback
             self.logger.exception("OpenRouter call failed; falling back to noop.", exc_info=exc)
 
@@ -318,6 +418,7 @@ class CognitiveCore:
         self,
         observation_b64: str,
         history: List[str],
+        include_visual_context: bool,
         user_prompt: Optional[str],
         repeat_info: Optional[Dict[str, Any]],
         plan: Optional["Plan"],
@@ -364,8 +465,30 @@ class CognitiveCore:
         if relevant_skills:
             skills_lines = []
             for s in relevant_skills:
-                skills_lines.append(f"- {s.name} (ID: {s.id}): {s.description}")
-            skills_context = "\nRelevant Skills/Macros:\n" + "\n".join(skills_lines) + "\nUse `run_skill` with the ID if applicable.\n"
+                param_blob = ""
+                if getattr(s, "parameters", None):
+                    rendered_params = []
+                    for key, spec in (s.parameters or {}).items():
+                        required = False
+                        description = ""
+                        if isinstance(spec, dict):
+                            required = bool(spec.get("required", False))
+                            description = str(spec.get("description", "")).strip()
+                        elif isinstance(spec, str):
+                            description = spec.strip()
+                        suffix = " (required)" if required else ""
+                        if description:
+                            rendered_params.append(f"{key}{suffix}: {description}")
+                        else:
+                            rendered_params.append(f"{key}{suffix}")
+                    if rendered_params:
+                        param_blob = " | params: " + "; ".join(rendered_params[:5])
+                skills_lines.append(f"- {s.name} (ID: {s.id}): {s.description}{param_blob}")
+            skills_context = (
+                "\nRelevant Skills/Macros:\n"
+                + "\n".join(skills_lines)
+                + "\nUse `run_skill` with the ID and pass `skill_args` when the skill exposes params.\n"
+            )
 
         ax_context = ""
         som_context = ""
@@ -386,39 +509,72 @@ class CognitiveCore:
                 + "\n".join(som_lines)
             )
 
-        browser_tool_line = (
-            "- `browser`: for high-speed reading/navigation of web pages."
-            if not windows_cyborg
-            else "- `browser`: CDP-based on Windows and may be unavailable; prefer `computer` for web automation."
+        allow_gui = self.settings.allows_gui_actions()
+        allow_browser = self.settings.allows_browser_actions()
+        allow_shell = self.settings.allows_shell_actions()
+
+        tool_lines = []
+        if allow_gui:
+            tool_lines.append("- `computer`: for low-level mouse/keyboard interaction and UI inspection (`inspect_ui`).")
+        if allow_browser:
+            tool_lines.append(
+                "- `browser`: CDP-based on Windows and may be unavailable; prefer `computer` for web automation."
+                if windows_cyborg
+                else "- `browser`: for high-speed reading/navigation of web pages."
+            )
+        if allow_shell:
+            tool_lines.append("- `shell`: for local workspace file operations in the sandbox.")
+        tool_lines.append("- `notebook`: for saving facts and notes to persistent memory (use this to avoid forgetting things).")
+
+        if allow_browser:
+            browser_research_lines = (
+                "- For Research:\n"
+                "  1. Use `browser` tool to `get_links` or `get_page_content`.\n"
+                "  2. Read the content.\n"
+                "  3. SAVE key findings using `notebook` tool (`add_note`).\n"
+                "  4. This prevents data loss when context window fills up."
+                if not windows_cyborg
+                else "- For Research on Windows Cyborg mode:\n"
+                "  1. Prefer `inspect_ui` + the accessibility summary + screenshot grounding.\n"
+                "  2. If you must use `browser`, it may fail unless CDP is enabled; switch back to `computer` immediately on CDP errors.\n"
+                "  3. SAVE key findings using `notebook` (`add_note`)."
+            )
+            browser_preference_line = (
+                "- Prefer `browser` tools over `computer` OCR/Vision for text-heavy web tasks."
+                if not windows_cyborg
+                else "- Windows Cyborg mode: prefer `computer` + `inspect_ui` + HID/Phantom Mode; avoid `browser` unless CDP is confirmed working."
+            )
+        elif allow_gui:
+            browser_research_lines = (
+                "- Browser tool is disabled in this execution profile; use `inspect_ui`, semantic grounding, and notebook notes."
+            )
+            browser_preference_line = "- Browser tool unavailable in current execution profile."
+        else:
+            browser_research_lines = (
+                "- GUI/browser tools are disabled in this execution profile; solve tasks through `shell` and `notebook`."
+            )
+            browser_preference_line = "- GUI/browser actions are disabled in current execution profile."
+
+        shell_safety_lines = (
+            "- No network access via shell (use browser tool when available).\n- `shell` is sandboxed."
+            if allow_shell
+            else "- `shell` tool is disabled in this execution profile."
         )
-        browser_research_lines = (
-            "- For Research:\n"
-            "  1. Use `browser` tool to `get_links` or `get_page_content`.\n"
-            "  2. Read the content.\n"
-            "  3. SAVE key findings using `notebook` tool (`add_note`).\n"
-            "  4. This prevents data loss when context window fills up."
-            if not windows_cyborg
-            else "- For Research on Windows Cyborg mode:\n"
-            "  1. Prefer `inspect_ui` + the accessibility summary + screenshot grounding.\n"
-            "  2. If you must use `browser`, it may fail unless CDP is enabled; switch back to `computer` immediately on CDP errors.\n"
-            "  3. SAVE key findings using `notebook` (`add_note`)."
-        )
-        browser_preference_line = (
-            "- Prefer `browser` tools over `computer` OCR/Vision for text-heavy web tasks."
-            if not windows_cyborg
-            else "- Windows Cyborg mode: prefer `computer` + `inspect_ui` + HID/Phantom Mode; avoid `browser` unless CDP is confirmed working."
+        visual_context_line = (
+            "- This turn includes an up-to-date screenshot."
+            if include_visual_context
+            else "- This turn has no screenshot. Re-plan from history + semantic state only; if uncertain, request `vision_full` verification."
         )
 
         system_prompt = f"""
-            You are a cautious, focused {self.platform_name} desktop operator. You have a robust toolbox including:
-            - `computer`: for low-level mouse/keyboard interaction and UI inspection (`inspect_ui`).
-            {browser_tool_line}
-            - `notebook`: for saving facts and notes to persistent memory (use this to avoid forgetting things).
-            - `shell`: for local workspace file operations.
+            You are a high-efficiency {self.platform_name} autonomous desktop operator.
+            Execution profile: {self.settings.execution_profile}.
+            Toolbox:
+            {chr(10).join(tool_lines)}
 
-            At each step you see a single screenshot of the current display plus a short textual history of previous actions and
-            observations.
+            At each step you receive textual history, and may also receive a screenshot of the current display.
             - You may return a *macro action* by supplying `actions: [...]` to batch multiple low-level steps in one call.
+            - Every action block MUST include a `verification` contract with `sensor`, optional `expected_state`, and `timeout_seconds`.
             {plan_text}
             {loop_state_text}
             {skills_context}
@@ -426,11 +582,14 @@ class CognitiveCore:
             {som_context}
 
             Planning & Thinking
+            {visual_context_line}
             - Always reason from what is currently visible: windows, icons, menus.
             - Use the provided Accessibility Tree and numbered overlay marks to ground actions. If a tag exists, return its ID via `element_id` instead of guessing coordinates.
             - Use `inspect_ui` if visual elements are ambiguous or you need to find hidden controls.
             - Coordinates: only provide x/y when no overlay tag is available. If using x/y, return logical display points (screenshot is already downscaled to logical resolution).
             - To reduce latency, prefer batching obvious sequences (e.g., click + type + enter) using `actions`.
+            - Sensor pyramid (prefer cheapest): `none` -> `os_telemetry` -> `a11y_tree` -> `pixel_diff` -> `vision_full`.
+            - Use `vision_full` only when context is lost, UI is purely visual, or cheaper validation failed.
             {browser_research_lines}
 
             Environment
@@ -441,8 +600,7 @@ class CognitiveCore:
             
             Safety
             - No destructive actions.
-            - No network access via shell (use browser tool).
-            - `shell` is sandboxed.
+            {shell_safety_lines}
             
             Action Selection
             - Prefer batching obvious sequences using the `actions` array (macro_actions) to cut latency.
@@ -463,16 +621,23 @@ class CognitiveCore:
         mime = "image/png" if self.settings.encode_format.lower() == "png" else "image/jpeg"
 
         task_hint = f"User request: {user_prompt}" if user_prompt else "No explicit user task provided."
-        content = [
+        prompt_suffix = (
+            "Plan the next step. Prefer a single macro action (actions array) when multiple sequential steps are obvious. "
+            "Always return a verification contract for the action block."
+        )
+        content: List[Dict[str, Any]] = [
             {
                 "type": "text",
-                "text": f"{task_hint}\n\nPlan the next step. Prefer a single macro action (actions array) when multiple sequential steps are obvious.",
-            },
-            {
-                "type": "image_url",
-                "image_url": {"url": f"data:{mime};base64,{observation_b64}"},
-            },
+                "text": f"{task_hint}\n\n{prompt_suffix}",
+            }
         ]
+        if include_visual_context and observation_b64:
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime};base64,{observation_b64}"},
+                }
+            )
 
         messages = [
             {"role": "system", "content": system_prompt},
@@ -495,10 +660,23 @@ class CognitiveCore:
         return self.client.chat.completions.create(
             model=self.settings.openrouter_model,
             messages=messages,
-            tools=[COMPUTER_TOOL, SHELL_TOOL, NOTEBOOK_TOOL, BROWSER_TOOL],
+            tools=self._available_tools(),
             tool_choice="auto",
             extra_body=extra_body if extra_body else None,
         )
+
+    def _available_tools(self) -> List[Dict[str, Any]]:
+        tool_flags = self._tool_enabled_map()
+        tools: List[Dict[str, Any]] = []
+        if tool_flags.get("notebook"):
+            tools.append(NOTEBOOK_TOOL)
+        if tool_flags.get("computer"):
+            tools.append(COMPUTER_TOOL)
+        if tool_flags.get("shell"):
+            tools.append(SHELL_TOOL)
+        if tool_flags.get("browser"):
+            tools.append(BROWSER_TOOL)
+        return tools
 
     def _parse_tool_call(self, response: Any) -> Optional[Dict[str, Any]]:
         """Extract the first tool call and map it to the local action schema."""
@@ -530,6 +708,12 @@ class CognitiveCore:
         return {"type": "noop", "reason": f"unknown tool {tool_name}"}
 
     def _map_tool_args(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        if not self.settings.allows_gui_actions():
+            return {
+                "type": "noop",
+                "reason": f"execution profile '{self.settings.execution_profile}' blocks GUI actions",
+            }
+
         # Macro-action path: a list of sub-actions
         if isinstance(args.get("actions"), list):
             mapped_actions = []
@@ -541,7 +725,17 @@ class CognitiveCore:
                     mapped_actions.append(mapped)
             if not mapped_actions:
                 return {"type": "noop", "reason": "macro_actions provided but no valid sub-actions"}
-            return {"type": "macro_actions", "actions": mapped_actions}
+            payload = {"type": "macro_actions", "actions": mapped_actions}
+            contract = self._normalize_verification_contract(
+                args.get("verification"),
+                fallback_sensor="a11y_tree",
+                verify_after=args.get("verify_after"),
+            )
+            if contract:
+                payload["verification"] = contract
+            if args.get("rationale"):
+                payload["_debug_rationale"] = str(args.get("rationale"))[:600]
+            return payload
 
         return self._map_single_computer_action(args)
 
@@ -552,6 +746,16 @@ class CognitiveCore:
         def _apply_verify(payload: Dict[str, Any]) -> Dict[str, Any]:
             if verify_after is not None:
                 payload["verify_after"] = bool(verify_after)
+            contract = self._normalize_verification_contract(
+                args.get("verification"),
+                fallback_sensor=self._default_sensor_for_action_type(str(action or "")),
+                verify_after=verify_after,
+            )
+            if contract:
+                payload["verification"] = contract
+            rationale = args.get("rationale")
+            if rationale:
+                payload["_debug_rationale"] = str(rationale)[:600]
             return payload
         
         # Common phantom_mode handling for click/hover actions
@@ -671,15 +875,91 @@ class CognitiveCore:
         if action == "inspect_ui":
             return _apply_verify({"type": "inspect_ui"})
         if action == "run_skill":
-            return _apply_verify({
+            payload = {
                 "type": "run_skill",
                 "skill_id": args.get("skill_id"),
                 "skill_name": args.get("skill_name"),
-            })
+            }
+            raw_skill_args = args.get("skill_args")
+            if isinstance(raw_skill_args, dict):
+                cleaned_args: Dict[str, Any] = {}
+                for key, value in raw_skill_args.items():
+                    if isinstance(value, (str, int, float, bool)) and str(key).strip():
+                        cleaned_args[str(key)] = value
+                if cleaned_args:
+                    payload["skill_args"] = cleaned_args
+            return _apply_verify(payload)
 
         return {"type": "noop", "reason": f"unknown action {action}"}
 
+    def _default_sensor_for_action_type(self, action_type: str) -> str:
+        token = str(action_type or "").strip().lower()
+        if token in {"wait", "screenshot", "inspect_ui", "probe_ui"}:
+            return "none"
+        if token in {"clipboard_op", "open_app"}:
+            return "os_telemetry"
+        if token in {"move_mouse", "hover", "scroll"}:
+            return "none"
+        if token in {"run_skill", "drag_and_drop", "select_area", "left_click", "right_click", "double_click", "hotkey", "key", "type"}:
+            return "a11y_tree"
+        return "pixel_diff"
+
+    def _normalize_verification_contract(
+        self,
+        raw_contract: Any,
+        *,
+        fallback_sensor: str,
+        verify_after: Any,
+    ) -> Optional[Dict[str, Any]]:
+        if verify_after is False and not isinstance(raw_contract, dict):
+            return {"sensor": "none", "timeout_seconds": 1}
+
+        if raw_contract is None and verify_after is None:
+            return None
+
+        contract = raw_contract if isinstance(raw_contract, dict) else {}
+
+        fallback = str(fallback_sensor or "a11y_tree").strip().lower()
+        if fallback not in VERIFICATION_SENSOR_HIERARCHY:
+            fallback = "a11y_tree"
+
+        sensor = str(contract.get("sensor") or fallback).strip().lower()
+        if verify_after is False:
+            sensor = "none"
+        if sensor not in VERIFICATION_SENSOR_HIERARCHY:
+            sensor = fallback
+
+        timeout_raw = contract.get("timeout_seconds", 5)
+        try:
+            timeout_seconds = int(timeout_raw)
+        except (TypeError, ValueError):
+            timeout_seconds = 5
+        timeout_seconds = max(1, min(timeout_seconds, 30))
+        if sensor == "none":
+            timeout_seconds = 1
+
+        expected_state_raw = contract.get("expected_state")
+        expected_state = str(expected_state_raw).strip() if expected_state_raw is not None else None
+        if expected_state == "":
+            expected_state = None
+        if expected_state and len(expected_state) > 500:
+            expected_state = expected_state[:500]
+
+        payload: Dict[str, Any] = {
+            "sensor": sensor,
+            "timeout_seconds": timeout_seconds,
+        }
+        if expected_state:
+            payload["expected_state"] = expected_state
+        return payload
+
     def _map_shell_args(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        if not self.settings.allows_shell_actions():
+            return {
+                "type": "noop",
+                "reason": f"execution profile '{self.settings.execution_profile}' blocks shell actions",
+            }
+
         command = args.get("command") or ""
         cwd = args.get("cwd")
         if not command:
@@ -703,6 +983,12 @@ class CognitiveCore:
         }
 
     def _map_browser_args(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        if not self.settings.allows_browser_actions():
+            return {
+                "type": "noop",
+                "reason": f"execution profile '{self.settings.execution_profile}' blocks browser actions",
+            }
+
         cmd = args.get("command")
         windows_cyborg = self.platform_name.lower().startswith("windows") and self.settings.windows_cyborg_mode
         if windows_cyborg:
@@ -710,7 +996,7 @@ class CognitiveCore:
                 url = (args.get("url") or "").strip()
                 if not url:
                     return {"type": "capture_only", "reason": "browser.navigate missing url (Windows Cyborg mode)"}
-                return {
+                payload = {
                     "type": "macro_actions",
                     "actions": [
                         {"type": "key", "keys": ["ctrl", "l"]},
@@ -719,14 +1005,42 @@ class CognitiveCore:
                         {"type": "key", "keys": ["enter"]},
                     ],
                 }
+                payload["verification"] = self._normalize_verification_contract(
+                    args.get("verification"),
+                    fallback_sensor="a11y_tree",
+                    verify_after=args.get("verify_after"),
+                ) or {
+                    "sensor": "a11y_tree",
+                    "expected_state": self._default_cyborg_navigate_expected_state(url),
+                    "timeout_seconds": 8,
+                }
+                return payload
             if cmd == "go_back":
-                return {"type": "key", "keys": ["alt", "left"]}
+                payload = {"type": "key", "keys": ["alt", "left"]}
+                payload["verification"] = self._normalize_verification_contract(
+                    args.get("verification"),
+                    fallback_sensor="pixel_diff",
+                    verify_after=args.get("verify_after"),
+                ) or {"sensor": "pixel_diff", "timeout_seconds": 4}
+                return payload
             if cmd == "go_forward":
-                return {"type": "key", "keys": ["alt", "right"]}
+                payload = {"type": "key", "keys": ["alt", "right"]}
+                payload["verification"] = self._normalize_verification_contract(
+                    args.get("verification"),
+                    fallback_sensor="pixel_diff",
+                    verify_after=args.get("verify_after"),
+                ) or {"sensor": "pixel_diff", "timeout_seconds": 4}
+                return payload
             if cmd == "reload":
-                return {"type": "key", "keys": ["ctrl", "r"]}
+                payload = {"type": "key", "keys": ["ctrl", "r"]}
+                payload["verification"] = self._normalize_verification_contract(
+                    args.get("verification"),
+                    fallback_sensor="pixel_diff",
+                    verify_after=args.get("verify_after"),
+                ) or {"sensor": "pixel_diff", "timeout_seconds": 4}
+                return payload
 
-        return {
+        payload = {
             "type": "browser_op",
             "command": cmd,
             "app_name": args.get("app_name", "Safari"),
@@ -735,6 +1049,115 @@ class CognitiveCore:
             "value": args.get("value"),
             "execution": "browser"
         }
+        default_contract = self._default_browser_verification_for_command(cmd)
+        payload["verification"] = self._normalize_verification_contract(
+            args.get("verification"),
+            fallback_sensor=str(default_contract.get("sensor") or "pixel_diff"),
+            verify_after=args.get("verify_after"),
+        ) or default_contract
+        return payload
+
+    def _default_browser_verification_for_command(self, command: Any) -> Dict[str, Any]:
+        token = str(command or "").strip().lower()
+        if token in READ_ONLY_BROWSER_COMMANDS:
+            return {"sensor": "none", "timeout_seconds": 1}
+        return {"sensor": "pixel_diff", "timeout_seconds": 6}
+
+    def _default_cyborg_navigate_expected_state(self, url: str) -> str:
+        host = self._extract_url_host_token(url)
+        if host:
+            return f"url_contains:{host}"
+        return "state_change"
+
+    def _extract_url_host_token(self, url: str) -> str:
+        raw = str(url or "").strip()
+        if not raw:
+            return ""
+
+        candidate = raw if "://" in raw else f"https://{raw}"
+        host = ""
+        try:
+            parsed = urlparse(candidate)
+            host = str(parsed.hostname or "").strip().lower()
+        except Exception:
+            host = ""
+
+        if not host:
+            token = raw.lower()
+            for prefix in ("http://", "https://"):
+                if token.startswith(prefix):
+                    token = token[len(prefix):]
+                    break
+            host = token.split("/", 1)[0].split("?", 1)[0].strip().lower()
+
+        if host.startswith("www.") and len(host) > 4:
+            host = host[4:]
+        return host[:160]
+
+    def _extract_response_text(self, response: Any) -> str:
+        """Extract plain assistant text from a tool-call response for debug telemetry."""
+        choices = getattr(response, "choices", None) or []
+        if not choices:
+            return ""
+        message = getattr(choices[0], "message", None)
+        if message is None:
+            return ""
+
+        content = getattr(message, "content", "")
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            chunks: List[str] = []
+            for item in content:
+                if isinstance(item, str):
+                    chunks.append(item)
+                    continue
+                if isinstance(item, dict):
+                    text = item.get("text")
+                    if text:
+                        chunks.append(str(text))
+            return "\n".join(chunks).strip()
+        return str(content).strip()
+
+    def _annotate_with_debug_trace(
+        self,
+        action: Dict[str, Any],
+        model_text: str,
+        current_step: Optional["Step"],
+        loop_state: Optional[Dict[str, Any]],
+        repeat_info: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Attach concise cognitive trace metadata for the live dashboard."""
+        trace_parts: List[str] = []
+        if current_step:
+            trace_parts.append(f"step {current_step.id}: {current_step.description}")
+        if loop_state:
+            failure_count = loop_state.get("failure_count")
+            repeats = loop_state.get("repeat_without_change")
+            if failure_count is not None or repeats is not None:
+                trace_parts.append(f"loop failures={failure_count} repeat_without_change={repeats}")
+        if repeat_info and repeat_info.get("hint"):
+            trace_parts.append(f"hint: {repeat_info.get('hint')}")
+
+        debug_rationale = action.get("_debug_rationale")
+        if debug_rationale:
+            trace_parts.append(f"rationale: {debug_rationale}")
+        elif model_text:
+            trace_parts.append(f"model_note: {model_text}")
+
+        verification = action.get("verification")
+        if isinstance(verification, dict):
+            sensor = verification.get("sensor")
+            expected = verification.get("expected_state")
+            timeout = verification.get("timeout_seconds")
+            trace_parts.append(
+                f"verification: sensor={sensor} expected={expected or '-'} timeout={timeout or '-'}"
+            )
+
+        action_type = action.get("type", "unknown")
+        trace_parts.append(f"selected_action: {action_type}")
+        action["_debug_trace"] = "\n".join([part for part in trace_parts if part])[:1400]
+        return action
 
     def _summarize_ax_tree(self, tree: Dict[str, Any], max_nodes: int = 80, max_depth: int = 4) -> str:
         """

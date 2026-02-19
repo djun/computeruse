@@ -6,16 +6,24 @@ This repo is organized as a small multi-package workspace:
 - `macos_cua_agent/`: macOS adapter implementing the "computer" capabilities (screen capture, HID, Accessibility, AppleScript browser, permission checks).
 - `windows_cua_agent/`: Windows adapter (screen capture, SendInput HID, PowerShell shell sandbox, CDP browser; UIA semantic grounding + Phantom Mode via `comtypes`, with OCR/blob fallback when UIA is unavailable).
 
+Architecture boundary: core business logic lives in `cua_agent/`; adapter packages keep OS-specific drivers/integration code only.
+
 **What's inside (core + adapter)**
 - Orchestrator loop with planner + structured reflection, stagnation detection, and auto-replanning; episodes are summarized and logged.
-- Grounding from an accessibility/UI tree with numbered Set-of-Mark overlays; OCR/blob fallback when semantic trees are unavailable; pHash/SSIM change detection on logical-resolution captures.
+- Grounding from an accessibility/UI tree with numbered Set-of-Mark overlays; visual fallback uses optional detector backend (`ultralytics`), OCR, and blob proposals when semantic trees are unavailable; pHash/SSIM change detection on logical-resolution captures.
+- Optional live debug dashboard (FastAPI) with real-time screenshot preview, next-click crosshair, cognitive trace, and plan status stream.
 - Action execution via an adapter-provided computer implementation; adapters may offer semantic (Accessibility/UIA) paths, HID paths, browser ops, and sandboxed shell ops.
-- Memory layer storing episodes/logs/semantic notes and procedural skills with semantic hints; skills are retrieved via embeddings/keywords.
+- Memory layer storing episodes/logs/semantic notes and procedural skills with semantic hints; skills are retrieved via embeddings/keywords, with optional local vector indexing via Chroma.
 - Safety rules from `cua_agent/policies/safety_rules.yaml`.
+- HITL terminal confirmations (`[y/N]`) for policy-marked high-risk actions when running in an interactive shell.
+- Sensitive-screen redaction pass (OCR + blur) before screenshot frames are sent to model APIs.
+- Execution profiles to constrain tooling by context: `local_gui`, `remote_cli`, or `hybrid`.
 
 **Requirements**
 - Python 3.11+; install deps with `pip install -r requirements.txt`.
 - Optional: `brew install tesseract` to improve OCR for the visual fallback path.
+- Optional: install `ultralytics` and set `ENABLE_VISUAL_DETECTOR=true` for detector-assisted visual grounding.
+- ChromaDB is included in `requirements.txt` and can be enabled for local skill vector indexing (`ENABLE_CHROMA_SKILLS=true`).
 - OpenRouter account/key to drive the planner, cognitive core, and reflector models; without a key the agent runs in noop/stub mode.
 
 **Run**
@@ -26,6 +34,21 @@ This repo is organized as a small multi-package workspace:
 **Setup**
 - Create a `.env` with your keys and toggles (see `.env.example`).
 - Install deps with `pip install -r requirements.txt`.
+- Choose an execution profile:
+  - `EXECUTION_PROFILE=local_gui`: computer/browser enabled, shell blocked.
+  - `EXECUTION_PROFILE=remote_cli`: shell enabled, GUI/browser blocked.
+  - `EXECUTION_PROFILE=hybrid`: both enabled.
+- Optional debugging UX:
+  - `ENABLE_DEBUG_DASHBOARD=true`
+  - `DEBUG_DASHBOARD_HOST=127.0.0.1`
+  - `DEBUG_DASHBOARD_PORT=8765`
+- Strict post-action validation (recommended):
+  - `STRICT_POST_ACTION_STATE_CHANGE=true`
+- Recommended for procedural fast-path in production:
+  - `ENABLE_EMBEDDINGS=true`
+  - `ENABLE_FAST_PATH_SKILLS=true`
+  - `ENABLE_CHROMA_SKILLS=true`
+  - `CHROMA_PERSIST_DIR=.agent_memory/chroma`
 
 **Testing**
 - `pytest`

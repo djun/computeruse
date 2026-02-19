@@ -10,12 +10,38 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+VERIFICATION_SENSOR_HIERARCHY: tuple[str, ...] = (
+    "none",
+    "os_telemetry",
+    "a11y_tree",
+    "pixel_diff",
+    "vision_full",
+)
+DEFAULT_VERIFICATION_TIMEOUT_SECONDS = 5
+MAX_VERIFICATION_TIMEOUT_SECONDS = 30
+
 
 @dataclass
 class ActionResult:
     success: bool
     reason: str = ""
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class VerificationContract:
+    sensor: str = "none"
+    expected_state: str | None = None
+    timeout_seconds: int = DEFAULT_VERIFICATION_TIMEOUT_SECONDS
+
+    def to_dict(self) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "sensor": self.sensor,
+            "timeout_seconds": int(self.timeout_seconds),
+        }
+        if self.expected_state:
+            payload["expected_state"] = self.expected_state
+        return payload
 
 
 @dataclass
@@ -38,6 +64,8 @@ class Note:
 class StateManager:
     """Tracks loop state, history, and termination criteria."""
 
+    SENSOR_HIERARCHY = VERIFICATION_SENSOR_HIERARCHY
+
     def __init__(
         self,
         max_steps: int = 50,
@@ -56,6 +84,58 @@ class StateManager:
         self.steps = 0
         self.started_at = time.time()
         self.stuck_reasons: List[str] = []
+
+    @classmethod
+    def sensor_rank(cls, sensor: str) -> int:
+        token = str(sensor or "").strip().lower()
+        try:
+            return cls.SENSOR_HIERARCHY.index(token)
+        except ValueError:
+            return len(cls.SENSOR_HIERARCHY)
+
+    def normalize_verification_contract(
+        self,
+        raw_contract: Optional[Dict[str, Any]],
+        *,
+        fallback_sensor: str = "a11y_tree",
+        fallback_expected_state: Optional[str] = None,
+        verify_after: Optional[bool] = None,
+    ) -> VerificationContract:
+        candidate = raw_contract if isinstance(raw_contract, dict) else {}
+
+        fallback = str(fallback_sensor or "a11y_tree").strip().lower()
+        if fallback not in self.SENSOR_HIERARCHY:
+            fallback = "a11y_tree"
+
+        sensor = str(candidate.get("sensor") or fallback).strip().lower()
+        if verify_after is False:
+            sensor = "none"
+        if sensor not in self.SENSOR_HIERARCHY:
+            sensor = fallback
+
+        expected_state_raw = candidate.get("expected_state")
+        if expected_state_raw is None:
+            expected_state_raw = fallback_expected_state
+        expected_state = str(expected_state_raw).strip() if expected_state_raw is not None else None
+        if expected_state == "":
+            expected_state = None
+        if expected_state and len(expected_state) > 500:
+            expected_state = expected_state[:500]
+
+        timeout_raw = candidate.get("timeout_seconds", DEFAULT_VERIFICATION_TIMEOUT_SECONDS)
+        try:
+            timeout_seconds = int(timeout_raw)
+        except (TypeError, ValueError):
+            timeout_seconds = DEFAULT_VERIFICATION_TIMEOUT_SECONDS
+        timeout_seconds = max(1, min(timeout_seconds, MAX_VERIFICATION_TIMEOUT_SECONDS))
+        if sensor == "none":
+            timeout_seconds = 1
+
+        return VerificationContract(
+            sensor=sensor,
+            expected_state=expected_state,
+            timeout_seconds=timeout_seconds,
+        )
 
     def record_observation(
         self,
@@ -139,6 +219,12 @@ class StateManager:
     def record_stuck(self, reason: str) -> None:
         self.stuck_reasons.append(reason)
         self.history.append(f"stuck:{reason}")
+
+    def record_verification_failure(self, reason: str, action: Optional[Dict[str, Any]] = None) -> None:
+        """Record a post-action verification failure as a real failure signal."""
+        self.failure_count += 1
+        action_type = (action or {}).get("type", "unknown")
+        self.history.append(f"verification_failure:{action_type}:{reason}")
 
     def summary(self) -> Dict[str, Any]:
         return {

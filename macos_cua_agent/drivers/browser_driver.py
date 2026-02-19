@@ -7,11 +7,12 @@ import time
 from typing import Optional
 
 from cua_agent.agent.state_manager import ActionResult
+from cua_agent.computer.drivers import BaseBrowserDriver
 from cua_agent.utils.config import Settings
 from cua_agent.utils.logger import get_logger
 
 
-class BrowserDriver:
+class BrowserDriver(BaseBrowserDriver):
     """
     Advanced semantic browser interaction driver.
     Supports React/Angular form filling, DOM tree extraction, and arbitrary JS execution.

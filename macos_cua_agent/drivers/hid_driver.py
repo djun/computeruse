@@ -4,13 +4,14 @@ import subprocess
 from typing import Iterable, Optional, Tuple
 
 from cua_agent.agent.state_manager import ActionResult
+from cua_agent.computer.drivers import BaseHIDDriver
 from cua_agent.utils.config import Settings
 from cua_agent.utils.coordinates import point_to_px
 from cua_agent.utils.logger import get_logger
 from macos_cua_agent.utils.macos_integration import get_display_info
 
 
-class HIDDriver:
+class HIDDriver(BaseHIDDriver):
     """Executes low-level HID events. Defaults to dry-run unless ENABLE_HID is true."""
 
     def __init__(self, settings: Settings) -> None:

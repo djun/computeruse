@@ -12,11 +12,12 @@ from typing import Any, Optional
 from urllib.parse import urlparse
 
 from cua_agent.agent.state_manager import ActionResult
+from cua_agent.computer.drivers import BaseBrowserDriver
 from cua_agent.utils.config import Settings
 from cua_agent.utils.logger import get_logger
 
 
-class BrowserDriver:
+class BrowserDriver(BaseBrowserDriver):
     """
     Windows browser interaction driver via Chrome DevTools Protocol (CDP).
 
@@ -560,4 +561,3 @@ class _CDPClient:
         else:
             out.extend(payload)
         return bytes(out)
-

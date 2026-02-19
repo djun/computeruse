@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Optional
 
 from cua_agent.agent.state_manager import ActionResult
+from cua_agent.computer.drivers import BaseShellDriver
 from cua_agent.utils.config import Settings
 from cua_agent.utils.logger import get_logger
 
@@ -15,7 +16,7 @@ _ABS_DRIVE_RE = re.compile(r"(?i)\b[A-Z]:\\")
 _UNC_RE = re.compile(r"^\\\\")
 
 
-class ShellDriver:
+class ShellDriver(BaseShellDriver):
     """Runs sandboxed PowerShell commands inside a constrained workspace."""
 
     def __init__(self, settings: Settings) -> None:
@@ -43,6 +44,12 @@ class ShellDriver:
             }
 
     def execute(self, action: dict) -> ActionResult:
+        if not self.settings.allows_shell_actions():
+            return ActionResult(
+                success=False,
+                reason=f"execution profile '{self.settings.execution_profile}' blocks shell actions",
+            )
+
         cmd_raw = action.get("cmd") or action.get("command")
         if not cmd_raw:
             return ActionResult(success=False, reason="no command provided")
@@ -184,4 +191,3 @@ class ShellDriver:
             return True
         except Exception:
             return False
-

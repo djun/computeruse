@@ -5,6 +5,7 @@ import platform
 import re
 
 from cua_agent.agent.state_manager import ActionResult
+from cua_agent.computer.drivers import BaseAccessibilityDriver
 from cua_agent.utils.config import Settings
 from cua_agent.utils.logger import get_logger
 
@@ -46,7 +47,7 @@ _AX_POINT_RE = re.compile(r"x:(-?\d+(?:\.\d+)?)\s+y:(-?\d+(?:\.\d+)?)")
 _AX_SIZE_RE = re.compile(r"w:(-?\d+(?:\.\d+)?)\s+h:(-?\d+(?:\.\d+)?)")
 
 
-class AccessibilityDriver:
+class AccessibilityDriver(BaseAccessibilityDriver):
     """
     Provides semantic access to the macOS UI via the Accessibility API (AXUIElement).
     Allows the agent to 'see' the structure of windows and controls, not just pixels.

@@ -4,13 +4,14 @@ import os
 from typing import Any, Optional
 
 from cua_agent.agent.state_manager import ActionResult
+from cua_agent.computer.drivers import BaseAccessibilityDriver
 from cua_agent.utils.config import Settings
 from cua_agent.utils.coordinates import clamp_point, point_to_px
 from cua_agent.utils.logger import get_logger
 from windows_cua_agent.utils.windows_integration import get_display_info, get_foreground_process_image_name
 
 
-class AccessibilityDriver:
+class AccessibilityDriver(BaseAccessibilityDriver):
     """
     Windows semantic UI driver.
 

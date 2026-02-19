@@ -2,16 +2,13 @@
 
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import time
 import uuid
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-
-from cua_agent.utils.text import tokenize_lower
-
 
 def _fingerprint_actions(actions: List[Dict[str, Any]]) -> str:
     """Stable hash of a macro action list for deduplication."""
@@ -35,14 +32,26 @@ class ProceduralSkill:
     plan_step_id: Optional[str] = None
     embedding: Optional[List[float]] = None
     semantic_hints: Dict[str, Any] = field(default_factory=dict)
+    parameters: Dict[str, Any] = field(default_factory=dict)
+    verification_contract: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, raw: Dict[str, Any]) -> "ProceduralSkill":
+        actions = raw.get("actions")
+        if not actions and isinstance(raw.get("action_sequence"), list):
+            actions = raw.get("action_sequence")
+        parameters = raw.get("parameters", {}) or {}
+        if not isinstance(parameters, dict):
+            parameters = {}
+        verification_contract = raw.get("verification_contract", {}) or raw.get("verification", {}) or {}
+        if not isinstance(verification_contract, dict):
+            verification_contract = {}
+
         return cls(
             id=raw.get("id", str(uuid.uuid4())),
             name=raw.get("name", "unnamed"),
             description=raw.get("description", ""),
-            actions=raw.get("actions", []),
+            actions=actions or [],
             created_at=float(raw.get("created_at", time.time())),
             updated_at=float(raw.get("updated_at", time.time())),
             usage_count=int(raw.get("usage_count", 0)),
@@ -53,10 +62,15 @@ class ProceduralSkill:
             plan_step_id=raw.get("plan_step_id"),
             embedding=raw.get("embedding"),
             semantic_hints=raw.get("semantic_hints", {}) or {},
+            parameters=parameters,
+            verification_contract=verification_contract,
         )
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        payload = asdict(self)
+        # External format compatibility: some tooling expects this key.
+        payload["action_sequence"] = [dict(a) for a in self.actions]
+        return payload
 
 
 class SkillStore:
@@ -77,11 +91,17 @@ class SkillStore:
         plan_step_id: Optional[str] = None,
         embedding: Optional[List[float]] = None,
         semantic_hints: Optional[Dict[str, Any]] = None,
+        parameters: Optional[Dict[str, Any]] = None,
+        verification_contract: Optional[Dict[str, Any]] = None,
     ) -> ProceduralSkill:
         """Persist a skill; deduplicate by action fingerprint."""
         cleaned_actions = [dict(a) for a in (actions or []) if isinstance(a, dict)]
         if not cleaned_actions:
             raise ValueError("skill actions cannot be empty")
+        cleaned_parameters = dict(parameters) if isinstance(parameters, dict) else {}
+        cleaned_verification = (
+            dict(verification_contract) if isinstance(verification_contract, dict) else {}
+        )
 
         fingerprint = _fingerprint_actions(cleaned_actions)
         existing = self._find_by_fingerprint(fingerprint)
@@ -98,6 +118,10 @@ class SkillStore:
                 existing.embedding = embedding
             if semantic_hints:
                 existing.semantic_hints = semantic_hints
+            if cleaned_parameters:
+                existing.parameters = cleaned_parameters
+            if cleaned_verification:
+                existing.verification_contract = cleaned_verification
             self._write(existing)
             return existing
 
@@ -115,6 +139,8 @@ class SkillStore:
             plan_step_id=plan_step_id,
             embedding=embedding,
             semantic_hints=semantic_hints or {},
+            parameters=cleaned_parameters,
+            verification_contract=cleaned_verification,
         )
         self._write(skill)
         return skill

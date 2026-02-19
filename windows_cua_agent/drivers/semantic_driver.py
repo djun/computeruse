@@ -4,11 +4,12 @@ import ctypes
 from typing import Optional
 
 from cua_agent.agent.state_manager import ActionResult
+from cua_agent.computer.drivers import BaseSemanticDriver
 from cua_agent.utils.config import Settings
 from cua_agent.utils.logger import get_logger
 
 
-class SemanticDriver:
+class SemanticDriver(BaseSemanticDriver):
     """Best-effort semantic execution for Windows (focus app, basic intents)."""
 
     def __init__(self, settings: Settings) -> None:
@@ -66,4 +67,3 @@ class SemanticDriver:
             return ActionResult(success=True, reason=f"focused {app_name}")
         except Exception as exc:
             return ActionResult(success=False, reason=f"focus_app failed: {exc}")
-

@@ -3,7 +3,7 @@ from __future__ import annotations
 import base64
 import io
 import time
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 from PIL import Image, ImageChops, ImageDraw
@@ -13,13 +13,15 @@ try:
 except Exception:
     skimage_ssim = None
 
+from cua_agent.computer.drivers import BaseVisionPipeline
 from cua_agent.computer.types import DisplayInfo
 from cua_agent.utils.config import Settings
 from cua_agent.utils.logger import get_logger
+from cua_agent.utils.sensitive_redaction import redact_sensitive_regions
 from macos_cua_agent.utils.macos_integration import get_display_info
 
 
-class VisionPipeline:
+class VisionPipeline(BaseVisionPipeline):
     """Captures the framebuffer, aligns to logical resolution, and encodes to base64."""
 
     def __init__(self, settings: Settings) -> None:
@@ -28,6 +30,8 @@ class VisionPipeline:
         self.display: DisplayInfo = get_display_info()
         self.mss = self._build_mss()
         self._ssim_warned = False
+        self._detector_backend_warned: set[str] = set()
+        self._ultralytics_model: Any | None = None
 
     def _build_mss(self) -> Optional[object]:
         try:
@@ -40,13 +44,31 @@ class VisionPipeline:
 
     def capture_base64(self) -> str:
         image = self._grab_frame()
+        image = self._redact_sensitive_content(image)
         return self._encode_image(image)
 
     def capture_with_hash(self) -> tuple[str, str]:
         """Capture the screen and return (base64, perceptual hash)."""
         image = self._grab_frame()
+        image = self._redact_sensitive_content(image)
         img_hash = self._average_hash(image)
         return self._encode_image(image), img_hash
+
+    def _redact_sensitive_content(self, image: Image.Image) -> Image.Image:
+        if not self.settings.enable_sensitive_vision_redaction:
+            return image
+        try:
+            redacted, count = redact_sensitive_regions(
+                image,
+                min_confidence=float(self.settings.vision_redaction_min_ocr_conf),
+                blur_padding_px=int(self.settings.vision_redaction_blur_padding_px),
+            )
+            if count > 0:
+                self.logger.debug("Applied sensitive redaction to %d OCR region(s)", count)
+            return redacted
+        except Exception as exc:
+            self.logger.debug("Sensitive redaction failed: %s", exc)
+            return image
 
     def _grab_frame(self) -> Image.Image:
         if self.mss:
@@ -139,8 +161,9 @@ class VisionPipeline:
 
     def detect_ui_elements(self, image_b64: str) -> list[dict]:
         """
-        Fallback: Uses skimage to find potential UI elements (blobs/contours).
-        Returns list of dicts mimicking AX nodes. Includes optional OCR text boxes when pytesseract is available.
+        Visual grounding fallback.
+        Detection order: optional object detector -> OCR text boxes -> vision blobs.
+        Returns AX-like nodes compatible with the core tree contract.
         """
         try:
             img = self._decode(image_b64)
@@ -148,18 +171,130 @@ class VisionPipeline:
             self.logger.warning("Vision blob/OCR decode failed: %s", exc)
             return []
 
-        elements: list[dict] = []
+        candidates: list[dict] = []
+        candidates.extend(self._detect_with_optional_detector(img))
+        candidates.extend(self._detect_ocr_elements(img))
+        candidates.extend(self._detect_blob_elements(img))
+        return self._normalize_elements(candidates, img.width, img.height)
 
-        # 1) OCR-based text boxes (if pytesseract installed)
+    def _detect_with_optional_detector(self, image: Image.Image) -> list[dict]:
+        if not self.settings.enable_visual_detector:
+            return []
+
+        backend = (self.settings.visual_detector_backend or "auto").strip().lower()
+        if backend in {"none", "off", "disabled"}:
+            return []
+
+        if backend in {"auto", "ultralytics"}:
+            return self._detect_with_ultralytics(image, required=(backend == "ultralytics"))
+        if backend == "groundingdino":
+            key = "groundingdino"
+            if key not in self._detector_backend_warned:
+                self._detector_backend_warned.add(key)
+                self.logger.warning(
+                    "VISUAL_DETECTOR_BACKEND=groundingdino is not wired in this build; "
+                    "falling back to OCR/blob visual grounding."
+                )
+            return []
+
+        key = f"unknown:{backend}"
+        if key not in self._detector_backend_warned:
+            self._detector_backend_warned.add(key)
+            self.logger.warning("Unknown visual detector backend %r; using OCR/blob fallback only.", backend)
+        return []
+
+    def _detect_with_ultralytics(self, image: Image.Image, *, required: bool) -> list[dict]:
+        try:
+            from ultralytics import YOLO  # type: ignore
+        except Exception as exc:
+            if required:
+                self.logger.warning("Ultralytics backend requested but unavailable: %s", exc)
+            return []
+
+        model_name = (self.settings.visual_detector_model or "").strip() or "yolov8n.pt"
+        try:
+            if self._ultralytics_model is None or getattr(self._ultralytics_model, "_model_name", None) != model_name:
+                model = YOLO(model_name)
+                setattr(model, "_model_name", model_name)
+                self._ultralytics_model = model
+        except Exception as exc:
+            if required:
+                self.logger.warning("Failed to load ultralytics model %r: %s", model_name, exc)
+            else:
+                self.logger.debug("Ultralytics model %r unavailable: %s", model_name, exc)
+            return []
+
+        try:
+            np_img = np.array(image)
+            predictions = self._ultralytics_model.predict(
+                source=np_img,
+                conf=float(self.settings.visual_detector_confidence),
+                iou=float(self.settings.visual_detector_iou),
+                max_det=int(self.settings.visual_detector_max_detections),
+                verbose=False,
+            )
+        except Exception as exc:
+            if required:
+                self.logger.warning("Ultralytics inference failed: %s", exc)
+            else:
+                self.logger.debug("Ultralytics inference failed: %s", exc)
+            return []
+
+        out: list[dict] = []
+        if not predictions:
+            return out
+
+        result = predictions[0]
+        boxes = getattr(result, "boxes", None)
+        if boxes is None:
+            return out
+
+        names = getattr(result, "names", {}) or {}
+        for idx in range(len(boxes)):
+            try:
+                xyxy = boxes.xyxy[idx].tolist()
+                conf = float(boxes.conf[idx].item()) if hasattr(boxes, "conf") else None
+                cls_id = int(boxes.cls[idx].item()) if hasattr(boxes, "cls") else -1
+                x0, y0, x1, y1 = [float(v) for v in xyxy]
+                w = x1 - x0
+                h = y1 - y0
+                if w <= 1 or h <= 1:
+                    continue
+                class_name = str(names.get(cls_id, "detected_object"))
+                role = "AXUnknown"
+                class_l = class_name.lower()
+                if "button" in class_l:
+                    role = "AXButton"
+                elif "text" in class_l or "input" in class_l or "field" in class_l:
+                    role = "AXTextField"
+                elif "link" in class_l:
+                    role = "AXLink"
+                out.append(
+                    {
+                        "role": role,
+                        "title": class_name,
+                        "label": class_name,
+                        "frame": {"x": x0, "y": y0, "w": w, "h": h},
+                        "source": "detector_ultralytics",
+                        "confidence": conf,
+                        "path": f"vision.detector.ultralytics.{idx + 1}",
+                    }
+                )
+            except Exception:
+                continue
+        return out
+
+    def _detect_ocr_elements(self, image: Image.Image) -> list[dict]:
+        out: list[dict] = []
         try:
             import pytesseract  # type: ignore
 
-            ocr_data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+            ocr_data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT)
             n_boxes = len(ocr_data.get("text", []))
             for i in range(n_boxes):
                 text = (ocr_data["text"][i] or "").strip()
                 conf = float(ocr_data.get("conf", [0])[i] or 0)
-                if not text or conf < 55:  # discard low-confidence/no-text boxes
+                if not text or conf < 55:
                     continue
                 x, y, w, h = (
                     int(ocr_data["left"][i]),
@@ -167,83 +302,169 @@ class VisionPipeline:
                     int(ocr_data["width"][i]),
                     int(ocr_data["height"][i]),
                 )
-                if w <= 0 or h <= 0:
+                if w <= 1 or h <= 1:
                     continue
-                elements.append(
+                out.append(
                     {
                         "role": "AXStaticText",
                         "title": text,
                         "label": text,
                         "frame": {"x": x, "y": y, "w": w, "h": h},
                         "source": "ocr",
+                        "confidence": conf / 100.0,
                     }
                 )
         except ImportError:
-            # pytesseract is optional; silently skip if unavailable
             pass
         except Exception as exc:
             self.logger.debug("OCR detection failed: %s", exc)
+        return out
 
-        # 2) Vision blobs via skimage (if available)
+    def _detect_blob_elements(self, image: Image.Image) -> list[dict]:
+        out: list[dict] = []
         try:
-            if skimage_ssim is not None:
-                from skimage import filters, measure, morphology
-                import numpy as np
+            if skimage_ssim is None:
+                return out
+            from skimage import filters, measure, morphology
 
-                gray = np.array(img.convert("L"))
+            gray = np.array(image.convert("L"))
+            edges = filters.sobel(gray)
+            mask = edges > 0.04
+            closed = morphology.closing(mask, morphology.footprint_rectangle((3, 3)))
+            labels = measure.label(closed)
+            props = measure.regionprops(labels)
 
-                # Edge detection (Sobel)
-                edges = filters.sobel(gray)
+            min_area = 120
+            max_area = (image.width * image.height) / 3
 
-                # Threshold to get binary mask (heuristic)
-                mask = edges > 0.04
+            for prop in props:
+                if prop.area < min_area or prop.area > max_area:
+                    continue
+                minr, minc, maxr, maxc = prop.bbox
+                out.append(
+                    {
+                        "role": "AXUnknown",
+                        "title": "visual_element",
+                        "label": "visual_element",
+                        "frame": {"x": minc, "y": minr, "w": maxc - minc, "h": maxr - minr},
+                        "source": "vision_blob",
+                    }
+                )
+        except Exception as exc:
+            self.logger.debug("Vision blob detection failed: %s", exc)
+        return out
 
-                # Close gaps to form solid shapes
-                closed = morphology.closing(mask, morphology.footprint_rectangle((3, 3)))
+    def _normalize_elements(self, elements: list[dict], width: int, height: int) -> list[dict]:
+        cleaned: list[dict] = []
+        for idx, elem in enumerate(elements, start=1):
+            frame = self._coerce_frame(elem.get("frame"))
+            if not frame:
+                continue
+            frame = self._clip_frame(frame, width, height)
+            if not frame:
+                continue
 
-                # Label regions
-                labels = measure.label(closed)
-                props = measure.regionprops(labels)
+            role = (elem.get("role") or "").strip() or "AXUnknown"
+            title = str(elem.get("title") or "").strip()
+            label = str(elem.get("label") or title or role).strip()
+            source = str(elem.get("source") or "vision").strip() or "vision"
+            path = str(elem.get("path") or f"vision.{source}.{idx}").strip()
+            confidence = elem.get("confidence")
+            try:
+                confidence_val = float(confidence) if confidence is not None else None
+            except Exception:
+                confidence_val = None
 
-                min_area = 100  # 10x10 px
-                max_area = (img.width * img.height) / 4
+            node = {
+                "role": role,
+                "title": title or label,
+                "label": label,
+                "frame": frame,
+                "source": source,
+                "path": path,
+            }
+            if confidence_val is not None:
+                node["confidence"] = max(0.0, min(confidence_val, 1.0))
+            cleaned.append(node)
 
-                for prop in props:
-                    if prop.area < min_area or prop.area > max_area:
-                        continue
+        if not cleaned:
+            return []
 
-                    minr, minc, maxr, maxc = prop.bbox
-                    # bbox is (min_row, min_col, max_row, max_col) -> (y, x, y+h, x+w)
+        def _priority(node: dict) -> float:
+            frame = node.get("frame") or {}
+            area = float(frame.get("w", 0)) * float(frame.get("h", 0))
+            src = (node.get("source") or "").lower()
+            conf = float(node.get("confidence", 0.0) or 0.0)
+            if "detector" in src:
+                src_bias = 3.0
+            elif src == "ocr":
+                src_bias = 2.0
+            else:
+                src_bias = 1.0
+            return src_bias + conf + min(area / 15000.0, 2.0)
 
-                    elements.append(
-                        {
-                            "role": "AXUnknown",  # Generic
-                            "title": "visual_element",
-                            "frame": {
-                                "x": minc,
-                                "y": minr,
-                                "w": maxc - minc,
-                                "h": maxr - minr,
-                            },
-                            "source": "vision_blob",
-                        }
-                    )
-        except Exception as e:
-            self.logger.warning("Vision blob detection failed: %s", e)
+        cleaned.sort(key=_priority, reverse=True)
 
-        # Prioritize text boxes, then blobs; cap to avoid clutter
-        if elements:
-            # Largest areas first, but keep OCR entries on top by adding a bias
-            def _score(elem: dict) -> float:
-                frame = elem.get("frame") or {}
-                area = float(frame.get("w", 0)) * float(frame.get("h", 0))
-                bias = 1e6 if elem.get("source") == "ocr" else 0.0
-                return bias + area
+        deduped: list[dict] = []
+        for node in cleaned:
+            frame = node.get("frame") or {}
+            duplicate = False
+            for kept in deduped:
+                if self._frame_iou(frame, kept.get("frame") or {}) >= 0.85:
+                    duplicate = True
+                    break
+            if not duplicate:
+                deduped.append(node)
+            if len(deduped) >= 120:
+                break
 
-            elements.sort(key=_score, reverse=True)
-            return elements[:80]
+        return deduped
 
-        return []
+    def _coerce_frame(self, frame: Any) -> dict | None:
+        if not isinstance(frame, dict):
+            return None
+        try:
+            x = float(frame.get("x", 0))
+            y = float(frame.get("y", 0))
+            w = float(frame.get("w", 0))
+            h = float(frame.get("h", 0))
+        except Exception:
+            return None
+        return {"x": x, "y": y, "w": w, "h": h}
+
+    def _clip_frame(self, frame: dict, width: int, height: int) -> dict | None:
+        x0 = max(0.0, min(float(width), frame["x"]))
+        y0 = max(0.0, min(float(height), frame["y"]))
+        x1 = max(0.0, min(float(width), frame["x"] + frame["w"]))
+        y1 = max(0.0, min(float(height), frame["y"] + frame["h"]))
+        w = x1 - x0
+        h = y1 - y0
+        if w <= 1.0 or h <= 1.0:
+            return None
+        return {"x": x0, "y": y0, "w": w, "h": h}
+
+    def _frame_iou(self, a: dict, b: dict) -> float:
+        ax0, ay0 = float(a.get("x", 0)), float(a.get("y", 0))
+        ax1, ay1 = ax0 + float(a.get("w", 0)), ay0 + float(a.get("h", 0))
+        bx0, by0 = float(b.get("x", 0)), float(b.get("y", 0))
+        bx1, by1 = bx0 + float(b.get("w", 0)), by0 + float(b.get("h", 0))
+
+        inter_x0 = max(ax0, bx0)
+        inter_y0 = max(ay0, by0)
+        inter_x1 = min(ax1, bx1)
+        inter_y1 = min(ay1, by1)
+        inter_w = max(0.0, inter_x1 - inter_x0)
+        inter_h = max(0.0, inter_y1 - inter_y0)
+        inter = inter_w * inter_h
+        if inter <= 0:
+            return 0.0
+
+        area_a = max(0.0, (ax1 - ax0) * (ay1 - ay0))
+        area_b = max(0.0, (bx1 - bx0) * (by1 - by0))
+        union = area_a + area_b - inter
+        if union <= 0:
+            return 0.0
+        return inter / union
 
     def _decode(self, image_b64: str) -> Image.Image:
         raw = base64.b64decode(image_b64)

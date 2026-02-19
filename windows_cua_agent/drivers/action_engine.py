@@ -3,9 +3,18 @@ from __future__ import annotations
 import math
 import re
 import subprocess
+import sys
 import time
 
 from cua_agent.agent.state_manager import ActionResult
+from cua_agent.computer.drivers import (
+    BaseAccessibilityDriver,
+    BaseBrowserDriver,
+    BaseHIDDriver,
+    BaseSemanticDriver,
+    BaseShellDriver,
+    BaseVisionPipeline,
+)
 from cua_agent.policies.policy_engine import PolicyEngine
 from cua_agent.utils.ax_utils import flatten_nodes_with_frames
 from cua_agent.utils.config import Settings
@@ -25,32 +34,43 @@ from windows_cua_agent.utils.windows_integration import (
 class ActionEngine:
     """Routes actions through policy evaluation, semantic path, or HID injection."""
 
-    def __init__(self, settings: Settings, policy_engine: PolicyEngine) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        policy_engine: PolicyEngine,
+        vision_pipeline: BaseVisionPipeline | None = None,
+    ) -> None:
         self.settings = settings
         self.policy_engine = policy_engine
         self.display = get_display_info()
-        self.hid_driver = HIDDriver(settings)
-        self.semantic_driver = SemanticDriver(settings)
-        self.shell_driver = ShellDriver(settings)
-        self.accessibility_driver = AccessibilityDriver(settings)
-        self.browser_driver = BrowserDriver(settings)
+        self.hid_driver: BaseHIDDriver = HIDDriver(settings)
+        self.semantic_driver: BaseSemanticDriver = SemanticDriver(settings)
+        self.shell_driver: BaseShellDriver = ShellDriver(settings)
+        self.accessibility_driver: BaseAccessibilityDriver = AccessibilityDriver(settings)
+        self.browser_driver: BaseBrowserDriver = BrowserDriver(settings)
+        self.vision_pipeline = vision_pipeline
         self.logger = get_logger(__name__, level=settings.log_level)
 
     def execute(self, action: dict) -> ActionResult:
         action = self._enrich_action(action)
-
-        # Windows-specific HITL triggers (best-effort).
-        if self._requires_hitl(action):
-            self.logger.warning("Action requires human confirmation: %s", action)
-            return ActionResult(success=False, reason="human confirmation required")
+        allowed, deny_reason = self._is_allowed_by_execution_profile(action)
+        if not allowed:
+            return ActionResult(success=False, reason=deny_reason)
 
         decision = self.policy_engine.evaluate(action)
         if not decision.allowed:
             self.logger.warning("Action blocked by policy: %s", decision.reason)
             return ActionResult(success=False, reason=decision.reason)
-        if decision.hitl_required:
+
+        hitl_reason = decision.reason if decision.hitl_required else ""
+        if not hitl_reason and self._requires_hitl(action):
+            hitl_reason = "windows high-risk heuristic"
+
+        if hitl_reason:
             self.logger.warning("Action requires human confirmation: %s", action)
-            return ActionResult(success=False, reason="human confirmation required")
+            approved, deny_reason = self._request_hitl_approval(action, hitl_reason)
+            if not approved:
+                return ActionResult(success=False, reason=deny_reason)
 
         # Special-cased actions for loop control.
         if action.get("type") in ("noop", "capture_only"):
@@ -65,7 +85,10 @@ class ActionEngine:
         action_type = action.get("type")
 
         if action_type == "inspect_ui":
-            return self.accessibility_driver.get_active_window_tree()
+            ax_res = self.accessibility_driver.get_active_window_tree()
+            if ax_res.success:
+                return ax_res
+            return self._inspect_ui_visual_fallback(ax_res.reason)
 
         if action_type == "probe_ui":
             x = action.get("x")
@@ -73,7 +96,11 @@ class ActionEngine:
             if x is None or y is None:
                 return ActionResult(success=False, reason="probe_ui requires x,y coordinates")
             radius = float(action.get("radius") or 0.0)
-            return self.accessibility_driver.probe_element(x, y, radius=radius)
+            ax_probe = self.accessibility_driver.probe_element(x, y, radius=radius)
+            if ax_probe.success:
+                return ax_probe
+            visual_probe = self._probe_ui_visual_fallback(float(x), float(y), ax_probe.reason)
+            return visual_probe if visual_probe.success else ax_probe
 
         if action_type == "clipboard_op":
             return self._handle_clipboard(action)
@@ -111,6 +138,27 @@ class ActionEngine:
         self.logger.info("Action result: success=%s reason=%s", result.success, result.reason)
         return result
 
+    def _is_allowed_by_execution_profile(self, action: dict) -> tuple[bool, str]:
+        profile = self.settings.execution_profile
+        execution_path = str(action.get("execution") or "hid")
+        action_type = str(action.get("type") or "")
+
+        if profile == "remote_cli":
+            allowed_types = {"noop", "capture_only", "wait", "sandbox_shell"}
+            if action_type in allowed_types:
+                if action_type == "sandbox_shell" and execution_path != "shell":
+                    return False, "execution profile 'remote_cli' requires shell execution for sandbox_shell"
+                return True, ""
+            if execution_path == "shell":
+                return True, ""
+            return False, "execution profile 'remote_cli' blocks GUI/browser actions"
+
+        if profile == "local_gui":
+            if action_type == "sandbox_shell" or execution_path == "shell":
+                return False, "execution profile 'local_gui' blocks shell actions"
+
+        return True, ""
+
     def _requires_hitl(self, action: dict) -> bool:
         # UAC / elevation prompts.
         exe = (action.get("bundle_id") or "").lower()
@@ -129,6 +177,56 @@ class ActionEngine:
                 return True
 
         return False
+
+    def _request_hitl_approval(self, action: dict, reason: str) -> tuple[bool, str]:
+        if not self.settings.enable_hitl_prompt:
+            self.logger.warning("HITL prompt disabled; denying high-risk action.")
+            return False, "human confirmation required"
+
+        stdin = getattr(sys, "stdin", None)
+        if not stdin or not hasattr(stdin, "isatty") or not stdin.isatty():
+            self.logger.warning("HITL confirmation required but no interactive stdin; denying action.")
+            return False, "human confirmation required"
+
+        summary = self._summarize_hitl_action(action)
+        prompt = (
+            "\n[HITL] High-risk action requested.\n"
+            f"[HITL] Reason: {reason}\n"
+            f"[HITL] Action: {summary}\n"
+            "[HITL] Approve execution? [y/N]: "
+        )
+        try:
+            answer = input(prompt).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return False, "human confirmation required"
+
+        if answer in {"y", "yes"}:
+            return True, ""
+        return False, "human confirmation denied"
+
+    def _summarize_hitl_action(self, action: dict) -> str:
+        action_type = str(action.get("type") or "unknown")
+        if action_type == "sandbox_shell":
+            command = str(action.get("cmd") or action.get("command") or "")
+            return f"sandbox_shell cmd={command[:220]}"
+        if action.get("execution") == "browser":
+            command = str(action.get("command") or "")
+            page_url = str(action.get("page_url") or action.get("url") or "")
+            return f"browser command={command} url={page_url[:220]}"
+
+        keys = [
+            "type",
+            "execution",
+            "command",
+            "app_name",
+            "bundle_id",
+            "x",
+            "y",
+            "target_x",
+            "target_y",
+        ]
+        details = {k: action.get(k) for k in keys if action.get(k) is not None}
+        return str(details)
 
     def _enrich_action(self, action: dict) -> dict:
         """
@@ -232,6 +330,62 @@ class ActionEngine:
 
         return None
 
+    def _inspect_ui_visual_fallback(self, ax_reason: str) -> ActionResult:
+        if not self.vision_pipeline:
+            return ActionResult(success=False, reason=ax_reason or "inspect_ui failed and vision fallback unavailable")
+
+        try:
+            frame = self.vision_pipeline.capture_base64()
+            elements = self.vision_pipeline.detect_ui_elements(frame)
+        except Exception as exc:
+            return ActionResult(success=False, reason=f"visual inspect fallback failed: {exc}")
+
+        if not elements:
+            reason = "visual grounding found no elements"
+            if ax_reason:
+                reason = f"{ax_reason}; {reason}"
+            return ActionResult(success=False, reason=reason)
+
+        tree = {
+            "role": "AXWindow",
+            "title": "Visual Fallback",
+            "frame": {"x": 0, "y": 0, "w": self.display.logical_width, "h": self.display.logical_height},
+            "children": elements,
+        }
+        reason = "captured via visual grounding fallback"
+        if ax_reason:
+            reason = f"{reason} (after AX failure: {ax_reason})"
+        return ActionResult(
+            success=True,
+            reason=reason,
+            metadata={"tree": tree, "grounding": "vision_fallback", "element_count": len(elements)},
+        )
+
+    def _probe_ui_visual_fallback(self, x: float, y: float, ax_reason: str) -> ActionResult:
+        if not self.vision_pipeline:
+            return ActionResult(success=False, reason=ax_reason or "probe_ui failed and vision fallback unavailable")
+        try:
+            frame = self.vision_pipeline.capture_base64()
+            elements = self.vision_pipeline.detect_ui_elements(frame)
+        except Exception as exc:
+            return ActionResult(success=False, reason=f"visual probe fallback failed: {exc}")
+
+        if not elements:
+            reason = "visual grounding found no elements"
+            if ax_reason:
+                reason = f"{ax_reason}; {reason}"
+            return ActionResult(success=False, reason=reason)
+
+        best = self._pick_visual_node(elements, "", "", "", x, y, allow_anchor_only=True)
+        if not best:
+            return ActionResult(success=False, reason=ax_reason or "visual probe fallback could not localize element")
+
+        metadata = {"tree": best, "grounding": "vision_fallback"}
+        reason = "probed via visual grounding fallback"
+        if ax_reason:
+            reason = f"{reason} (after AX failure: {ax_reason})"
+        return ActionResult(success=True, reason=reason, metadata=metadata)
+
     def _handle_clipboard(self, action: dict) -> ActionResult:
         sub = action.get("sub_action")
         try:
@@ -291,6 +445,7 @@ class ActionEngine:
         return -sum((count / length) * math.log2(count / length) for count in freq.values())
 
     def _execute_hid(self, action: dict) -> ActionResult:
+        action = dict(action)
         action_type = action.get("type")
         x = action.get("x")
         y = action.get("y")
@@ -298,6 +453,7 @@ class ActionEngine:
         if phantom_mode is None and action.get("element_id") is not None:
             phantom_mode = True
         phantom_mode = bool(phantom_mode)
+        phantom_failed = False
 
         # Phantom mode: attempt semantic click before physical HID.
         if phantom_mode and action_type in ("left_click", "right_click", "double_click") and x is not None and y is not None:
@@ -320,7 +476,21 @@ class ActionEngine:
                     if second.success:
                         return ActionResult(success=True, reason="Phantom double_click via AXPress")
 
-            self.logger.info("Phantom mode failed, falling back to physical HID")
+            phantom_failed = True
+            self.logger.info("Phantom mode failed, attempting visual grounding fallback")
+
+        if phantom_failed:
+            action, retargeted = self._retarget_action_visually(action, allow_anchor_only=True)
+            if retargeted:
+                x = action.get("x")
+                y = action.get("y")
+                self.logger.info(
+                    "Visual fallback retargeted %s to (%s, %s) via %s",
+                    action_type,
+                    x,
+                    y,
+                    action.get("visual_source", "vision"),
+                )
 
         if action_type == "mouse_move" and x is not None and y is not None:
             return self.hid_driver.move(x, y)
@@ -368,7 +538,22 @@ class ActionEngine:
                 focused_res = self.accessibility_driver.set_focused_element_value(text)
                 if focused_res and focused_res.success:
                     return focused_res
-                self.logger.info("Phantom type failed, falling back to physical HID")
+                self.logger.info("Phantom type failed, attempting visual focus before physical HID typing")
+
+            hint_role = (action.get("semantic_role") or action.get("role") or "").strip()
+            hint_label = (action.get("semantic_label") or action.get("label") or "").strip()
+            hint_path = (action.get("semantic_path") or action.get("path") or "").strip()
+            if self.vision_pipeline and (phantom_mode or action.get("element_id") is not None or hint_role or hint_label or hint_path):
+                focused_action, retargeted = self._retarget_action_visually(action, allow_anchor_only=x is not None and y is not None)
+                if retargeted:
+                    fx = focused_action.get("x")
+                    fy = focused_action.get("y")
+                    if fx is not None and fy is not None:
+                        focus_res = self.hid_driver.left_click(fx, fy)
+                        if focus_res.success:
+                            time.sleep(0.05)
+                        else:
+                            self.logger.debug("Visual focus click failed before typing: %s", focus_res.reason)
             return self.hid_driver.type_text(text)
 
         if action_type == "key":
@@ -471,6 +656,141 @@ class ActionEngine:
         updated.setdefault("semantic_role", best.get("role", ""))
         updated.setdefault("semantic_label", best.get("label", ""))
         return updated, True
+
+    def _retarget_action_visually(self, action: dict, *, allow_anchor_only: bool = False) -> tuple[dict, bool]:
+        pointer_actions = {
+            "left_click",
+            "right_click",
+            "double_click",
+            "hover",
+            "mouse_move",
+            "type",
+        }
+        if action.get("type") not in pointer_actions:
+            return action, False
+        if not self.vision_pipeline:
+            return action, False
+
+        hint_role = (action.get("semantic_role") or action.get("role") or "").strip()
+        hint_label = (action.get("semantic_label") or action.get("label") or action.get("title") or "").strip()
+        hint_path = (action.get("semantic_path") or action.get("path") or "").strip()
+        anchor_x = action.get("x")
+        anchor_y = action.get("y")
+        has_hints = bool(hint_role or hint_label or hint_path)
+        if not has_hints and not allow_anchor_only:
+            return action, False
+        if not has_hints and (anchor_x is None or anchor_y is None):
+            return action, False
+
+        try:
+            frame = self.vision_pipeline.capture_base64()
+            nodes = self.vision_pipeline.detect_ui_elements(frame)
+        except Exception as exc:
+            self.logger.debug("Visual retarget capture/detect failed: %s", exc)
+            return action, False
+        if not nodes:
+            return action, False
+
+        best = self._pick_visual_node(
+            nodes,
+            hint_role,
+            hint_label,
+            hint_path,
+            float(anchor_x) if anchor_x is not None else None,
+            float(anchor_y) if anchor_y is not None else None,
+            allow_anchor_only=allow_anchor_only,
+        )
+        if not best:
+            return action, False
+
+        frame = best.get("frame") or {}
+        try:
+            cx = float(frame.get("x", 0)) + float(frame.get("w", 0)) / 2.0
+            cy = float(frame.get("y", 0)) + float(frame.get("h", 0)) / 2.0
+        except Exception:
+            return action, False
+
+        updated = dict(action)
+        updated["x"] = cx
+        updated["y"] = cy
+        updated["visual_source"] = best.get("source", "vision")
+        updated.setdefault("semantic_role", best.get("role", ""))
+        updated.setdefault("semantic_label", best.get("label", best.get("title", "")))
+        updated.setdefault("semantic_path", best.get("path", ""))
+        return updated, True
+
+    def _pick_visual_node(
+        self,
+        nodes: list[dict],
+        hint_role: str,
+        hint_label: str,
+        hint_path: str,
+        anchor_x: float | None,
+        anchor_y: float | None,
+        *,
+        allow_anchor_only: bool,
+    ) -> dict | None:
+        best = None
+        best_score = float("-inf")
+        hint_role_l = hint_role.lower()
+        hint_label_l = hint_label.lower()
+        hint_path_l = hint_path.lower()
+        anchor = (anchor_x, anchor_y) if anchor_x is not None and anchor_y is not None else None
+        has_hints = bool(hint_role_l or hint_label_l or hint_path_l)
+
+        for node in nodes:
+            frame = node.get("frame") or {}
+            try:
+                cx = float(frame.get("x", 0)) + float(frame.get("w", 0)) / 2.0
+                cy = float(frame.get("y", 0)) + float(frame.get("h", 0)) / 2.0
+            except Exception:
+                continue
+
+            role = str(node.get("role") or "").lower()
+            label = str(node.get("label") or node.get("title") or "").lower()
+            path = str(node.get("path") or "").lower()
+            src = str(node.get("source") or "").lower()
+            conf = float(node.get("confidence", 0.0) or 0.0)
+
+            if "detector" in src:
+                source_bias = 1.2
+            elif src == "ocr":
+                source_bias = 0.8
+            else:
+                source_bias = 0.2
+
+            if has_hints:
+                score = source_bias + conf
+                if hint_role_l:
+                    if role == hint_role_l:
+                        score += 3.0
+                    elif hint_role_l in role:
+                        score += 1.5
+                if hint_label_l:
+                    if label == hint_label_l:
+                        score += 5.0
+                    elif hint_label_l in label:
+                        score += 2.5
+                if hint_path_l:
+                    if path == hint_path_l:
+                        score += 4.0
+                    elif hint_path_l in path:
+                        score += 2.0
+                if score <= source_bias + conf:
+                    continue
+                if anchor:
+                    score -= math.hypot(cx - anchor[0], cy - anchor[1]) * 0.001
+            else:
+                if not allow_anchor_only or not anchor:
+                    continue
+                dist = math.hypot(cx - anchor[0], cy - anchor[1])
+                score = source_bias + conf + (1.0 / (1.0 + dist))
+
+            if score > best_score:
+                best_score = score
+                best = node
+
+        return best
 
     def _pick_semantic_node(
         self,

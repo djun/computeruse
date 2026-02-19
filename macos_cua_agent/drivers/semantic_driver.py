@@ -4,11 +4,12 @@ import subprocess
 from typing import Optional
 
 from cua_agent.agent.state_manager import ActionResult
+from cua_agent.computer.drivers import BaseSemanticDriver
 from cua_agent.utils.config import Settings
 from cua_agent.utils.logger import get_logger
 
 
-class SemanticDriver:
+class SemanticDriver(BaseSemanticDriver):
     """Semantic execution via AppleScript/JXA for high-level app intents."""
 
     def __init__(self, settings: Settings) -> None:
