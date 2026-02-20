@@ -1,7 +1,8 @@
 # Windows-specific safety rules for the CUA agent.
 
 blocked_actions:
-  - shell_command
+  - sandbox_shell
+  - shell_command  # legacy alias (kept for compatibility)
 
 # Windows adapter uses the `bundle_id` field to carry the active process image name (e.g., "taskmgr.exe").
 blocked_bundle_ids:
@@ -45,9 +46,29 @@ blocked_shell_basenames:
   - Invoke-WebRequest
   - Invoke-RestMethod
 
+allowed_script_extensions:
+  - .py
+  - .ps1
+  - .bat
+  - .cmd
+  - .js
+
+script_hitl_patterns:
+  - import socket
+  - from socket import
+  - import subprocess
+  - from subprocess import
+  - import os
+  - from os import
+  - eval(
+  - exec(
+  - __import__(
+  - invoke-webrequest
+  - invoke-restmethod
+  - powershell -
+
 exclusion_zones: []
 
 notes: |
   This file overrides the core defaults for Windows.
   Adjust allow/deny lists to match your risk appetite.
-

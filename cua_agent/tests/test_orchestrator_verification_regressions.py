@@ -10,6 +10,7 @@ def _orchestrator() -> Orchestrator:
 def test_default_sensor_for_shell_action_is_none() -> None:
     orchestrator = _orchestrator()
     assert orchestrator._default_sensor_for_action({"type": "sandbox_shell"}) == "none"
+    assert orchestrator._default_sensor_for_action({"type": "script_op"}) == "none"
 
 
 def test_default_sensor_for_clipboard_depends_on_sub_action_and_open_app_stays_os_telemetry() -> None:

@@ -1232,8 +1232,8 @@ class Orchestrator:
         action_type = str(action.get("type") or "").strip().lower()
         if action_type in {"wait", "capture_only", "noop", "inspect_ui", "probe_ui", "notebook_op", "mouse_move", "hover", "scroll"}:
             return "none"
-        if action_type in {"sandbox_shell"}:
-            # Shell actions often have no reliable UI/telemetry delta; default to no-op verification
+        if action_type in {"sandbox_shell", "script_op"}:
+            # Shell/script actions often have no reliable UI/telemetry delta; default to no-op verification
             # unless the action explicitly provides a stronger contract.
             return "none"
         if action_type == "clipboard_op":
@@ -1884,6 +1884,7 @@ class Orchestrator:
             "notebook_op",
             "clipboard_op",
             "sandbox_shell",
+            "script_op",
             "browser_op",
             "mouse_move",
             "hover",

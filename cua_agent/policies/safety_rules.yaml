@@ -1,6 +1,7 @@
 # Shared safety rules for the CUA core (applies across adapters).
 blocked_actions:
-  - shell_command
+  - sandbox_shell
+  - shell_command  # legacy alias (kept for compatibility)
 
 blocked_bundle_ids:
   - com.apple.keychainaccess
@@ -37,6 +38,28 @@ blocked_shell_basenames:
   - nc
   - telnet
   - ftp
+
+allowed_script_extensions:
+  - .py
+  - .sh
+  - .js
+  - .ps1
+  - .bat
+  - .cmd
+
+script_hitl_patterns:
+  - import socket
+  - from socket import
+  - import subprocess
+  - from subprocess import
+  - import os
+  - from os import
+  - eval(
+  - exec(
+  - __import__(
+  - powershell -
+  - invoke-webrequest
+  - invoke-restmethod
 
 notes: |
   Extend this file to reflect local risk appetite and app allow/deny lists.

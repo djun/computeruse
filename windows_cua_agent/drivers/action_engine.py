@@ -45,7 +45,8 @@ class ActionEngine:
         self.display = get_display_info()
         self.hid_driver: BaseHIDDriver = HIDDriver(settings)
         self.semantic_driver: BaseSemanticDriver = SemanticDriver(settings)
-        self.shell_driver: BaseShellDriver = ShellDriver(settings)
+        shell_allowlist = getattr(policy_engine, "shell_allowlist", None)
+        self.shell_driver: BaseShellDriver = ShellDriver(settings, allowed_commands=shell_allowlist)
         self.accessibility_driver: BaseAccessibilityDriver = AccessibilityDriver(settings)
         self.browser_driver: BaseBrowserDriver = BrowserDriver(settings)
         self.vision_pipeline = vision_pipeline
@@ -144,17 +145,19 @@ class ActionEngine:
         action_type = str(action.get("type") or "")
 
         if profile == "remote_cli":
-            allowed_types = {"noop", "capture_only", "wait", "sandbox_shell"}
+            allowed_types = {"noop", "capture_only", "wait", "sandbox_shell", "script_op"}
             if action_type in allowed_types:
-                if action_type == "sandbox_shell" and execution_path != "shell":
-                    return False, "execution profile 'remote_cli' requires shell execution for sandbox_shell"
+                if action_type in {"sandbox_shell", "script_op"} and execution_path != "shell":
+                    return False, (
+                        f"execution profile 'remote_cli' requires shell execution for {action_type}"
+                    )
                 return True, ""
             if execution_path == "shell":
                 return True, ""
             return False, "execution profile 'remote_cli' blocks GUI/browser actions"
 
         if profile == "local_gui":
-            if action_type == "sandbox_shell" or execution_path == "shell":
+            if action_type in {"sandbox_shell", "script_op"} or execution_path == "shell":
                 return False, "execution profile 'local_gui' blocks shell actions"
 
         return True, ""
@@ -175,7 +178,6 @@ class ActionEngine:
             script_exts = [".ps1", ".bat", ".vbs"]
             if any(ext in cmd for ext in script_exts):
                 return True
-
         return False
 
     def _request_hitl_approval(self, action: dict, reason: str) -> tuple[bool, str]:
@@ -218,6 +220,8 @@ class ActionEngine:
             "type",
             "execution",
             "command",
+            "operation",
+            "path",
             "app_name",
             "bundle_id",
             "x",

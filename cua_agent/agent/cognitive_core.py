@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 from urllib.parse import urlparse
 
 from cua_agent.agent.state_manager import VERIFICATION_SENSOR_HIERARCHY
@@ -11,6 +12,17 @@ from cua_agent.utils.logger import get_logger
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from cua_agent.orchestrator.planning import Plan, Step
+
+
+@dataclass
+class ToolRegistration:
+    """Tool schema + routing contract used by CognitiveCore."""
+
+    name: str
+    schema: Dict[str, Any]
+    enabled: Callable[["CognitiveCore"], bool]
+    mapper: Callable[["CognitiveCore", Dict[str, Any]], Dict[str, Any]]
+
 
 # OpenRouter exposes an OpenAI-compatible tool-calling API. We define our own
 # computer tool schema so Claude Opus 4.5 can drive local actions.
@@ -246,6 +258,53 @@ SHELL_TOOL = {
     },
 }
 
+SCRIPT_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "script",
+        "description": (
+            "Safer script workflow inside the sandbox workspace. "
+            "Write/update scripts, read files, and run approved script files."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["write", "read", "run"]},
+                "path": {
+                    "type": "string",
+                    "description": "Relative path under the sandbox workspace (e.g., tools/report.py).",
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Script content used by action=write.",
+                },
+                "overwrite": {
+                    "type": "boolean",
+                    "description": "When false, write fails if file already exists.",
+                    "default": True,
+                },
+                "args": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional command-line arguments used by action=run.",
+                },
+                "runtime_seconds": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 120,
+                    "description": "Optional runtime limit for action=run (capped by runtime policy).",
+                },
+                "cwd": {
+                    "type": "string",
+                    "description": "Optional relative working directory under the agent workspace.",
+                },
+            },
+            "required": ["action", "path"],
+            "additionalProperties": False,
+        },
+    },
+}
+
 NOTEBOOK_TOOL = {
     "type": "function",
     "function": {
@@ -325,16 +384,101 @@ class CognitiveCore:
         self.display = computer.display
         self.system_info = computer.system_info
         self.platform_name = computer.platform_name
+        self._tool_registry: Dict[str, ToolRegistration] = {}
+        self._tool_order: List[str] = []
+        self._register_default_tools()
         self.client = self._build_client()
         self._log_execution_profile_startup()
 
     def _tool_enabled_map(self) -> Dict[str, bool]:
-        return {
-            "computer": self.settings.allows_gui_actions(),
-            "browser": self.settings.allows_browser_actions(),
-            "shell": self.settings.allows_shell_actions(),
-            "notebook": True,
-        }
+        self._ensure_tool_registry()
+        status: Dict[str, bool] = {}
+        for tool_name in self._tool_order:
+            registration = self._tool_registry.get(tool_name)
+            if not registration:
+                continue
+            try:
+                status[tool_name] = bool(registration.enabled(self))
+            except Exception:
+                status[tool_name] = False
+        return status
+
+    def _shell_tool_enabled(self) -> bool:
+        return self.settings.allows_shell_actions() and bool(self.settings.enable_shell)
+
+    def register_tool(self, registration: ToolRegistration, *, position: Optional[int] = None) -> None:
+        """Register a tool schema and mapper for dynamic tool expansion."""
+        tool_name = str(registration.name or "").strip()
+        if not tool_name:
+            raise ValueError("tool registration requires a non-empty name")
+        schema_name = str(registration.schema.get("function", {}).get("name", "")).strip()
+        if schema_name and schema_name != tool_name:
+            raise ValueError(
+                f"tool registration name mismatch: registration={tool_name} schema={schema_name}"
+            )
+
+        if tool_name in self._tool_registry:
+            # Replace existing definition while preserving original order.
+            self._tool_registry[tool_name] = registration
+            return
+
+        self._tool_registry[tool_name] = registration
+        if position is None or position >= len(self._tool_order):
+            self._tool_order.append(tool_name)
+        else:
+            self._tool_order.insert(max(position, 0), tool_name)
+
+    def _register_default_tools(self) -> None:
+        self.register_tool(
+            ToolRegistration(
+                name="notebook",
+                schema=NOTEBOOK_TOOL,
+                enabled=lambda core: True,
+                mapper=lambda core, args: core._map_notebook_args(args),
+            )
+        )
+        self.register_tool(
+            ToolRegistration(
+                name="computer",
+                schema=COMPUTER_TOOL,
+                enabled=lambda core: core.settings.allows_gui_actions(),
+                mapper=lambda core, args: core._map_tool_args(args),
+            )
+        )
+        self.register_tool(
+            ToolRegistration(
+                name="shell",
+                schema=SHELL_TOOL,
+                enabled=lambda core: core._shell_tool_enabled(),
+                mapper=lambda core, args: core._map_shell_args(args),
+            )
+        )
+        self.register_tool(
+            ToolRegistration(
+                name="script",
+                schema=SCRIPT_TOOL,
+                enabled=lambda core: core._shell_tool_enabled(),
+                mapper=lambda core, args: core._map_script_args(args),
+            )
+        )
+        self.register_tool(
+            ToolRegistration(
+                name="browser",
+                schema=BROWSER_TOOL,
+                enabled=lambda core: core.settings.allows_browser_actions(),
+                mapper=lambda core, args: core._map_browser_args(args),
+            )
+        )
+
+    def _ensure_tool_registry(self) -> None:
+        # Some unit tests instantiate via __new__ and bypass __init__.
+        if not hasattr(self, "_tool_registry"):
+            self._tool_registry = {}
+        if not hasattr(self, "_tool_order"):
+            self._tool_order = []
+        if not self._tool_registry:
+            self._tool_order = []
+            self._register_default_tools()
 
     def _log_execution_profile_startup(self) -> None:
         status = self._tool_enabled_map()
@@ -509,9 +653,12 @@ class CognitiveCore:
                 + "\n".join(som_lines)
             )
 
-        allow_gui = self.settings.allows_gui_actions()
-        allow_browser = self.settings.allows_browser_actions()
-        allow_shell = self.settings.allows_shell_actions()
+        tool_status = self._tool_enabled_map()
+        allow_gui = bool(tool_status.get("computer", False))
+        allow_browser = bool(tool_status.get("browser", False))
+        allow_shell = bool(tool_status.get("shell", False))
+        allow_script = bool(tool_status.get("script", False))
+        allow_notebook = bool(tool_status.get("notebook", False))
 
         tool_lines = []
         if allow_gui:
@@ -524,7 +671,10 @@ class CognitiveCore:
             )
         if allow_shell:
             tool_lines.append("- `shell`: for local workspace file operations in the sandbox.")
-        tool_lines.append("- `notebook`: for saving facts and notes to persistent memory (use this to avoid forgetting things).")
+        if allow_script:
+            tool_lines.append("- `script`: safer write/read/run flow for workspace scripts with stricter guardrails.")
+        if allow_notebook:
+            tool_lines.append("- `notebook`: for saving facts and notes to persistent memory (use this to avoid forgetting things).")
 
         if allow_browser:
             browser_research_lines = (
@@ -551,14 +701,16 @@ class CognitiveCore:
             browser_preference_line = "- Browser tool unavailable in current execution profile."
         else:
             browser_research_lines = (
-                "- GUI/browser tools are disabled in this execution profile; solve tasks through `shell` and `notebook`."
+                "- GUI/browser tools are disabled in this execution profile; solve tasks through `shell`, `script`, and `notebook`."
+                if (allow_shell or allow_script)
+                else "- GUI/browser tools are disabled and `shell` is unavailable; collect notes with `notebook` and request a profile/config change when execution is required."
             )
             browser_preference_line = "- GUI/browser actions are disabled in current execution profile."
 
         shell_safety_lines = (
-            "- No network access via shell (use browser tool when available).\n- `shell` is sandboxed."
-            if allow_shell
-            else "- `shell` tool is disabled in this execution profile."
+            "- No network access via shell/script (use browser tool when available).\n- `shell` and `script` run inside a sandboxed workspace."
+            if (allow_shell or allow_script)
+            else "- `shell`/`script` tools are disabled (execution profile and/or ENABLE_SHELL=false)."
         )
         visual_context_line = (
             "- This turn includes an up-to-date screenshot."
@@ -666,20 +818,22 @@ class CognitiveCore:
         )
 
     def _available_tools(self) -> List[Dict[str, Any]]:
-        tool_flags = self._tool_enabled_map()
+        self._ensure_tool_registry()
         tools: List[Dict[str, Any]] = []
-        if tool_flags.get("notebook"):
-            tools.append(NOTEBOOK_TOOL)
-        if tool_flags.get("computer"):
-            tools.append(COMPUTER_TOOL)
-        if tool_flags.get("shell"):
-            tools.append(SHELL_TOOL)
-        if tool_flags.get("browser"):
-            tools.append(BROWSER_TOOL)
+        for tool_name in self._tool_order:
+            registration = self._tool_registry.get(tool_name)
+            if not registration:
+                continue
+            try:
+                if registration.enabled(self):
+                    tools.append(registration.schema)
+            except Exception as exc:
+                self.logger.warning("tool '%s' enablement check failed: %s", tool_name, exc)
         return tools
 
     def _parse_tool_call(self, response: Any) -> Optional[Dict[str, Any]]:
         """Extract the first tool call and map it to the local action schema."""
+        self._ensure_tool_registry()
         choices = getattr(response, "choices", [])
         if not choices:
             return None
@@ -697,15 +851,19 @@ class CognitiveCore:
         except json.JSONDecodeError:
             return {"type": "noop", "reason": f"bad tool args: {args_raw}"}
 
-        if tool_name == "computer":
-            return self._map_tool_args(args)
-        if tool_name == "shell":
-            return self._map_shell_args(args)
-        if tool_name == "notebook":
-            return self._map_notebook_args(args)
-        if tool_name == "browser":
-            return self._map_browser_args(args)
-        return {"type": "noop", "reason": f"unknown tool {tool_name}"}
+        registration = self._tool_registry.get(str(tool_name or ""))
+        if not registration:
+            return {"type": "noop", "reason": f"unknown tool {tool_name}"}
+
+        try:
+            mapped = registration.mapper(self, args)
+        except Exception as exc:
+            self.logger.exception("tool mapper failed for '%s'", tool_name, exc_info=exc)
+            return {"type": "noop", "reason": f"tool mapper failed: {tool_name}"}
+
+        if isinstance(mapped, dict):
+            return mapped
+        return {"type": "noop", "reason": f"tool mapper returned invalid payload: {tool_name}"}
 
     def _map_tool_args(self, args: Dict[str, Any]) -> Dict[str, Any]:
         if not self.settings.allows_gui_actions():
@@ -959,6 +1117,11 @@ class CognitiveCore:
                 "type": "noop",
                 "reason": f"execution profile '{self.settings.execution_profile}' blocks shell actions",
             }
+        if not self.settings.enable_shell:
+            return {
+                "type": "noop",
+                "reason": "shell disabled by ENABLE_SHELL=false",
+            }
 
         command = args.get("command") or ""
         cwd = args.get("cwd")
@@ -971,6 +1134,57 @@ class CognitiveCore:
             "cwd": cwd,
             "execution": "shell",
         }
+
+    def _map_script_args(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        if not self.settings.allows_shell_actions():
+            return {
+                "type": "noop",
+                "reason": f"execution profile '{self.settings.execution_profile}' blocks script actions",
+            }
+        if not self.settings.enable_shell:
+            return {
+                "type": "noop",
+                "reason": "script disabled by ENABLE_SHELL=false",
+            }
+
+        operation = str(args.get("action") or "").strip().lower()
+        path = str(args.get("path") or "").strip()
+        cwd = args.get("cwd")
+
+        if operation not in {"write", "read", "run"}:
+            return {"type": "noop", "reason": f"unknown script action {operation or 'none'}"}
+        if not path:
+            return {"type": "noop", "reason": "script path missing"}
+
+        payload: Dict[str, Any] = {
+            "type": "script_op",
+            "operation": operation,
+            "path": path,
+            "cwd": cwd,
+            "execution": "shell",
+        }
+
+        if operation == "write":
+            payload["content"] = str(args.get("content") or "")
+            payload["overwrite"] = bool(args.get("overwrite", True))
+            return payload
+
+        if operation == "run":
+            raw_args = args.get("args")
+            if isinstance(raw_args, list):
+                cleaned = [str(item) for item in raw_args if item is not None]
+                if cleaned:
+                    payload["args"] = cleaned
+
+            runtime_seconds = args.get("runtime_seconds")
+            if runtime_seconds is not None:
+                try:
+                    payload["runtime_seconds"] = int(runtime_seconds)
+                except (TypeError, ValueError):
+                    return {"type": "noop", "reason": "script runtime_seconds must be an integer"}
+            return payload
+
+        return payload
 
     def _map_notebook_args(self, args: Dict[str, Any]) -> Dict[str, Any]:
         action = args.get("action")

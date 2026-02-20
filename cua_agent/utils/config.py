@@ -78,6 +78,11 @@ class Settings:
     shell_max_runtime_s: int = int(os.getenv("SHELL_MAX_RUNTIME_S", "10"))
     shell_max_output_bytes: int = int(os.getenv("SHELL_MAX_OUTPUT_BYTES", "65536"))
     shell_allowed_commands: str = os.getenv("SHELL_ALLOWED_COMMANDS", "")
+    script_allowed_extensions: str = os.getenv(
+        "SCRIPT_ALLOWED_EXTENSIONS",
+        ".py,.sh,.js,.ps1,.bat,.cmd",
+    )
+    script_max_file_bytes: int = int(os.getenv("SCRIPT_MAX_FILE_BYTES", "131072"))
 
     # Browser/AppleScript safety
     browser_script_timeout_s: float = float(os.getenv("BROWSER_SCRIPT_TIMEOUT_S", "8"))
@@ -157,3 +162,14 @@ class Settings:
 
     def allows_shell_actions(self) -> bool:
         return self.execution_profile in {"remote_cli", "hybrid"}
+
+    def script_extension_allowlist(self) -> set[str]:
+        raw = str(self.script_allowed_extensions or "")
+        parsed = {
+            "." + token.strip().lstrip(".").lower()
+            for token in raw.split(",")
+            if token and token.strip()
+        }
+        if parsed:
+            return parsed
+        return {".py", ".sh", ".js", ".ps1", ".bat", ".cmd"}

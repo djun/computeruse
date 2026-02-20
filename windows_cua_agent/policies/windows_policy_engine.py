@@ -19,6 +19,7 @@ class WindowsPolicyEngine(PolicyEngine):
     def __init__(self, rules_path: str, settings: Settings | None = None) -> None:
         super().__init__(rules_path, settings=settings)
         self._settings = settings
+        self.shell_allowlist = self._resolve_shell_allowlist()
 
     def evaluate(self, action: Dict[str, Any]) -> PolicyDecision:
         action_type = action.get("type") or action.get("action")
@@ -32,13 +33,8 @@ class WindowsPolicyEngine(PolicyEngine):
         cmd_stripped = cmd.strip()
         if not cmd_stripped:
             return PolicyDecision(False, "empty command")
-
-        # Allowlist from env/settings takes priority; fall back to rules file.
-        allow_env = (getattr(self._settings, "shell_allowed_commands", "") or "").strip() if self._settings else ""
-        if allow_env:
-            allow = {c.strip().lower() for c in allow_env.split(",") if c.strip()}
-        else:
-            allow = {c.lower() for c in self.rules.get("allowed_shell_basenames", []) if isinstance(c, str)}
+        allow = self.shell_allowlist
+        blocked = self._normalized_rule_list("blocked_shell_basenames")
 
         # Heuristic: validate each pipeline stage's command token.
         stages = [s.strip() for s in cmd_stripped.split("|") if s.strip()]
@@ -46,6 +42,8 @@ class WindowsPolicyEngine(PolicyEngine):
             token = stage.split(None, 1)[0].strip().strip("\"'").lower()
             if not token:
                 return PolicyDecision(False, "empty pipeline stage")
+            if blocked and token in blocked:
+                return PolicyDecision(False, f"command blocked: {token}")
             if allow and token not in allow:
                 return PolicyDecision(False, f"command not allowed: {token}")
 
@@ -69,3 +67,25 @@ class WindowsPolicyEngine(PolicyEngine):
 
         return PolicyDecision(True)
 
+    def _resolve_shell_allowlist(self) -> set[str]:
+        # Source of truth order: env/settings -> policy rules -> conservative defaults.
+        allow_env = (getattr(self._settings, "shell_allowed_commands", "") or "").strip() if self._settings else ""
+        if allow_env:
+            parsed = {c.strip().lower() for c in allow_env.split(",") if c.strip()}
+            if parsed:
+                return parsed
+
+        from_rules = self._normalized_rule_list("allowed_shell_basenames")
+        if from_rules:
+            return from_rules
+
+        return {
+            "dir",
+            "type",
+            "copy",
+            "move",
+            "del",
+            "select-string",
+            "get-childitem",
+            "get-content",
+        }

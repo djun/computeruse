@@ -117,17 +117,19 @@ class ActionEngine:
         action_type = str(action.get("type") or "")
 
         if profile == "remote_cli":
-            allowed_types = {"noop", "capture_only", "wait", "sandbox_shell"}
+            allowed_types = {"noop", "capture_only", "wait", "sandbox_shell", "script_op"}
             if action_type in allowed_types:
-                if action_type == "sandbox_shell" and execution_path != "shell":
-                    return False, "execution profile 'remote_cli' requires shell execution for sandbox_shell"
+                if action_type in {"sandbox_shell", "script_op"} and execution_path != "shell":
+                    return False, (
+                        f"execution profile 'remote_cli' requires shell execution for {action_type}"
+                    )
                 return True, ""
             if execution_path == "shell":
                 return True, ""
             return False, "execution profile 'remote_cli' blocks GUI/browser actions"
 
         if profile == "local_gui":
-            if action_type == "sandbox_shell" or execution_path == "shell":
+            if action_type in {"sandbox_shell", "script_op"} or execution_path == "shell":
                 return False, "execution profile 'local_gui' blocks shell actions"
 
         return True, ""
@@ -451,6 +453,8 @@ class ActionEngine:
             "type",
             "execution",
             "command",
+            "operation",
+            "path",
             "app_name",
             "bundle_id",
             "x",

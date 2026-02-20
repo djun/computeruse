@@ -194,10 +194,20 @@ class TestExtensions(unittest.TestCase):
         self.assertIn("notebook", names)
         self.assertNotIn("shell", names)
 
-    def test_available_tools_remote_cli_profile(self):
-        core = CognitiveCore(Settings(execution_profile="remote_cli"), _DummyComputer())
+    def test_available_tools_remote_cli_profile_with_shell_enabled(self):
+        core = CognitiveCore(Settings(execution_profile="remote_cli", enable_shell=True), _DummyComputer())
         names = [tool["function"]["name"] for tool in core._available_tools()]
         self.assertIn("shell", names)
+        self.assertIn("script", names)
+        self.assertIn("notebook", names)
+        self.assertNotIn("computer", names)
+        self.assertNotIn("browser", names)
+
+    def test_available_tools_remote_cli_profile_shell_disabled_by_default(self):
+        core = CognitiveCore(Settings(execution_profile="remote_cli"), _DummyComputer())
+        names = [tool["function"]["name"] for tool in core._available_tools()]
+        self.assertNotIn("shell", names)
+        self.assertNotIn("script", names)
         self.assertIn("notebook", names)
         self.assertNotIn("computer", names)
         self.assertNotIn("browser", names)
@@ -213,6 +223,12 @@ class TestExtensions(unittest.TestCase):
         result = core._map_shell_args({"command": "echo hello"})
         self.assertEqual(result["type"], "noop")
         self.assertIn("local_gui", result["reason"])
+
+    def test_shell_mapping_blocked_when_shell_flag_disabled(self):
+        core = CognitiveCore(Settings(execution_profile="remote_cli", enable_shell=False), _DummyComputer())
+        result = core._map_shell_args({"command": "echo hello"})
+        self.assertEqual(result["type"], "noop")
+        self.assertIn("ENABLE_SHELL=false", result["reason"])
 
     def test_cognitive_core_text_only_turn_omits_image_payload(self):
         core = CognitiveCore(Settings(use_openrouter=True), _DummyComputer())
@@ -281,6 +297,62 @@ class TestExtensions(unittest.TestCase):
         result = driver.execute({"command": "echo hello"})
         self.assertFalse(result.success)
         self.assertIn("local_gui", result.reason)
+
+    def test_shell_driver_script_write_and_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                execution_profile="remote_cli",
+                enable_shell=True,
+                shell_workspace_root=tmp,
+            )
+            driver = ShellDriver(settings)
+
+            write_res = driver.execute(
+                {
+                    "type": "script_op",
+                    "operation": "write",
+                    "path": "tools/demo.py",
+                    "content": "print('hello from script')\n",
+                }
+            )
+            self.assertTrue(write_res.success)
+
+            read_res = driver.execute(
+                {
+                    "type": "script_op",
+                    "operation": "read",
+                    "path": "tools/demo.py",
+                }
+            )
+            self.assertTrue(read_res.success)
+            self.assertIn("hello from script", read_res.metadata.get("stdout", ""))
+
+    def test_shell_driver_script_run_python(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                execution_profile="remote_cli",
+                enable_shell=True,
+                shell_workspace_root=tmp,
+            )
+            driver = ShellDriver(settings)
+            driver.execute(
+                {
+                    "type": "script_op",
+                    "operation": "write",
+                    "path": "tools/run_me.py",
+                    "content": "print('RUN_OK')\n",
+                }
+            )
+
+            run_res = driver.execute(
+                {
+                    "type": "script_op",
+                    "operation": "run",
+                    "path": "tools/run_me.py",
+                }
+            )
+            self.assertTrue(run_res.success)
+            self.assertIn("RUN_OK", run_res.metadata.get("stdout", ""))
 
     def test_inspect_ui_visual_fallback_when_ax_fails(self):
         engine = self._make_engine()

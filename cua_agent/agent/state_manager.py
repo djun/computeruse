@@ -197,6 +197,8 @@ class StateManager:
             "x": action.get("x"),
             "y": action.get("y"),
             "cmd": action.get("cmd"),
+            "operation": action.get("operation"),
+            "path": action.get("path"),
             "execution": action.get("execution"),
         }
         self.history.append(f"action:{action_summary}")
