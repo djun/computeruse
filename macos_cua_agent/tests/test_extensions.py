@@ -186,6 +186,54 @@ class TestExtensions(unittest.TestCase):
         self.assertEqual(result["skill_name"], "fill-form")
         self.assertFalse(result["verify_after"])
 
+    def test_map_click_element(self):
+        args = {"action": "click_element", "element_id": "btn-submit", "click_type": "double"}
+        result = self.core._map_single_computer_action(args)
+        self.assertEqual(result["type"], "click_element")
+        self.assertEqual(result["element_ref"], "btn-submit")
+        self.assertEqual(result["click_type"], "double")
+
+    def test_map_fill_field(self):
+        args = {"action": "fill_field", "element_id": "input-email", "text": "hello@example.com"}
+        result = self.core._map_single_computer_action(args)
+        self.assertEqual(result["type"], "fill_field")
+        self.assertEqual(result["element_ref"], "input-email")
+        self.assertEqual(result["text"], "hello@example.com")
+        self.assertTrue(result["clear"])
+
+    def test_map_wait_for_element(self):
+        args = {"action": "wait_for_element", "element_id": "msg-success", "timeout": 7}
+        result = self.core._map_single_computer_action(args)
+        self.assertEqual(result["type"], "wait_for_element")
+        self.assertEqual(result["element_ref"], "msg-success")
+        self.assertEqual(result["timeout"], 7.0)
+
+    def test_map_wait_for_element_rejects_coordinate_only(self):
+        args = {"action": "wait_for_element", "x": 10, "y": 20, "timeout": 5}
+        result = self.core._map_single_computer_action(args)
+        self.assertEqual(result["type"], "noop")
+        self.assertIn("requires element_id/element_ref", result["reason"])
+
+    def test_map_scroll_to_element_rejects_coordinate_only(self):
+        args = {"action": "scroll_to_element", "x": 10, "y": 20, "timeout": 5}
+        result = self.core._map_single_computer_action(args)
+        self.assertEqual(result["type"], "noop")
+        self.assertIn("requires element_id/element_ref", result["reason"])
+
+    def test_map_focus_window(self):
+        args = {"action": "focus_window", "window_title": "Planilha"}
+        result = self.core._map_single_computer_action(args)
+        self.assertEqual(result["type"], "focus_window")
+        self.assertEqual(result["window_title"], "Planilha")
+
+    def test_map_write_clipboard(self):
+        args = {"action": "write_clipboard", "text": "123", "paste": True}
+        result = self.core._map_single_computer_action(args)
+        self.assertEqual(result["type"], "clipboard_op")
+        self.assertEqual(result["sub_action"], "write")
+        self.assertEqual(result["content"], "123")
+        self.assertTrue(result["paste"])
+
     def test_available_tools_local_gui_profile(self):
         core = CognitiveCore(Settings(execution_profile="local_gui"), _DummyComputer())
         names = [tool["function"]["name"] for tool in core._available_tools()]
@@ -406,6 +454,103 @@ class TestExtensions(unittest.TestCase):
 
         self.assertTrue(result.success)
         engine.hid_driver.left_click.assert_called_once_with(120.0, 210.0)
+
+    def test_click_element_uses_semantic_lookup(self):
+        engine = self._make_engine()
+        engine.accessibility_driver.get_active_window_tree = MagicMock(
+            return_value=ActionResult(
+                True,
+                "captured",
+                metadata={
+                    "tree": {
+                        "role": "AXWindow",
+                        "frame": {"x": 0, "y": 0, "w": 1200, "h": 800},
+                        "children": [
+                            {
+                                "role": "AXButton",
+                                "title": "Submit",
+                                "frame": {"x": 100, "y": 200, "w": 80, "h": 30},
+                            }
+                        ],
+                    }
+                },
+            )
+        )
+        engine.hid_driver.left_click = MagicMock(return_value=ActionResult(True, "hid"))
+
+        result = engine.execute({"type": "click_element", "element_ref": "submit", "phantom_mode": False})
+
+        self.assertTrue(result.success)
+        engine.hid_driver.left_click.assert_called_once_with(140.0, 215.0)
+
+    def test_wait_for_element_semantic(self):
+        engine = self._make_engine()
+        engine.accessibility_driver.get_active_window_tree = MagicMock(
+            return_value=ActionResult(
+                True,
+                "captured",
+                metadata={
+                    "tree": {
+                        "role": "AXWindow",
+                        "frame": {"x": 0, "y": 0, "w": 1200, "h": 800},
+                        "children": [
+                            {
+                                "role": "AXStaticText",
+                                "title": "Sucesso",
+                                "frame": {"x": 50, "y": 80, "w": 120, "h": 24},
+                            }
+                        ],
+                    }
+                },
+            )
+        )
+
+        result = engine.execute({"type": "wait_for_element", "element_ref": "sucesso", "timeout": 0.5})
+
+        self.assertTrue(result.success)
+
+    def test_scroll_to_element_respects_max_scrolls(self):
+        engine = self._make_engine()
+        engine.accessibility_driver.get_active_window_tree = MagicMock(
+            return_value=ActionResult(
+                True,
+                "captured",
+                metadata={
+                    "tree": {
+                        "role": "AXWindow",
+                        "frame": {"x": 0, "y": 0, "w": 1200, "h": 800},
+                        "children": [
+                            {
+                                "role": "AXStaticText",
+                                "title": "Other",
+                                "frame": {"x": 50, "y": 80, "w": 120, "h": 24},
+                            }
+                        ],
+                    }
+                },
+            )
+        )
+        engine.hid_driver.scroll = MagicMock(return_value=ActionResult(True, "ok"))
+
+        result = engine.execute(
+            {"type": "scroll_to_element", "element_ref": "missing-target", "timeout": 1.0, "max_scrolls": 2}
+        )
+
+        self.assertFalse(result.success)
+        self.assertEqual(engine.hid_driver.scroll.call_count, 2)
+
+    @patch("macos_cua_agent.drivers.action_engine.subprocess.run")
+    def test_write_clipboard_with_paste(self, mock_run):
+        engine = self._make_engine()
+        mock_run.return_value = MagicMock(returncode=0)
+        engine.hid_driver.press_keys = MagicMock(return_value=ActionResult(True, "ok"))
+
+        result = engine.execute(
+            {"type": "clipboard_op", "sub_action": "write", "content": "abc", "paste": True}
+        )
+
+        self.assertTrue(result.success)
+        engine.hid_driver.press_keys.assert_called_with(["command", "v"])
 
     @patch("subprocess.check_output")
     def test_clipboard_redaction(self, mock_paste):

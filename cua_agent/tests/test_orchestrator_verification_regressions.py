@@ -21,6 +21,44 @@ def test_default_sensor_for_clipboard_depends_on_sub_action_and_open_app_stays_o
     assert orchestrator._default_sensor_for_action({"type": "open_app"}) == "os_telemetry"
 
 
+def test_default_sensor_for_focus_window_and_wait_for_idle() -> None:
+    orchestrator = _orchestrator()
+    assert orchestrator._default_sensor_for_action({"type": "focus_window"}) == "os_telemetry"
+    assert orchestrator._default_sensor_for_action({"type": "wait_for_idle"}) == "none"
+
+
+def test_resolve_element_references_numeric_element_ref_uses_overlay_id() -> None:
+    orchestrator = _orchestrator()
+    action = {"type": "click_element", "element_ref": "7"}
+    tags = [
+        {
+            "id": 7,
+            "role": "AXButton",
+            "label": "Submit",
+            "path": "AXWindow > AXButton:Submit",
+            "frame": {"x": 100.0, "y": 200.0, "w": 40.0, "h": 20.0},
+        }
+    ]
+
+    resolved = orchestrator._resolve_element_references(action, tags)
+
+    assert resolved is True
+    assert action["x"] == 120.0
+    assert action["y"] == 210.0
+    assert action["semantic_role"] == "AXButton"
+    assert action["semantic_label"] == "Submit"
+
+
+def test_resolve_element_references_numeric_element_ref_missing_id_fails() -> None:
+    orchestrator = _orchestrator()
+    action = {"type": "click_element", "element_ref": "9"}
+    tags = [{"id": 7, "frame": {"x": 1, "y": 2, "w": 3, "h": 4}}]
+
+    resolved = orchestrator._resolve_element_references(action, tags)
+
+    assert resolved is False
+
+
 def test_clipboard_write_contract_defaults_to_clipboard_equals() -> None:
     orchestrator = _orchestrator()
     contract = orchestrator._resolve_verification_contract(

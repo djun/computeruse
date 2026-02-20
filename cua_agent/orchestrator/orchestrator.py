@@ -948,15 +948,22 @@ class Orchestrator:
             "left_click",
             "right_click",
             "double_click",
+            "click_element",
             "mouse_move",
             "hover",
             "drag_and_drop",
             "select_area",
             "scroll",
+            "scroll_to_element",
             "type",
+            "fill_field",
+            "click_and_type",
             "key",
             "open_app",
+            "focus_window",
             "wait",
+            "wait_for_element",
+            "wait_for_idle",
         }
         action_type = action.get("type")
         if action_type not in allowed_types:
@@ -984,6 +991,15 @@ class Orchestrator:
             "role",
             "label",
             "path",
+            "element_ref",
+            "window_title",
+            "submit",
+            "clear",
+            "timeout",
+            "max_scrolls",
+            "paste",
+            "capture_selection",
+            "click_type",
         }
         cleaned: Dict[str, Any] = {}
         for key in keep_keys:
@@ -1230,7 +1246,20 @@ class Orchestrator:
 
     def _default_sensor_for_action(self, action: Dict[str, Any]) -> str:
         action_type = str(action.get("type") or "").strip().lower()
-        if action_type in {"wait", "capture_only", "noop", "inspect_ui", "probe_ui", "notebook_op", "mouse_move", "hover", "scroll"}:
+        if action_type in {
+            "wait",
+            "wait_for_element",
+            "wait_for_idle",
+            "capture_only",
+            "noop",
+            "inspect_ui",
+            "probe_ui",
+            "notebook_op",
+            "mouse_move",
+            "hover",
+            "scroll",
+            "scroll_to_element",
+        }:
             return "none"
         if action_type in {"sandbox_shell", "script_op"}:
             # Shell/script actions often have no reliable UI/telemetry delta; default to no-op verification
@@ -1243,7 +1272,7 @@ class Orchestrator:
             if sub_action == "read":
                 return "none"
             return "os_telemetry"
-        if action_type == "open_app":
+        if action_type in {"open_app", "focus_window"}:
             return "os_telemetry"
         if action_type in {"browser_op"}:
             return "pixel_diff"
@@ -1877,6 +1906,8 @@ class Orchestrator:
 
         non_transition_types = {
             "wait",
+            "wait_for_element",
+            "wait_for_idle",
             "capture_only",
             "noop",
             "inspect_ui",
@@ -1889,15 +1920,20 @@ class Orchestrator:
             "mouse_move",
             "hover",
             "scroll",
+            "scroll_to_element",
             "type",
+            "fill_field",
         }
         if action_type in non_transition_types:
             return False
 
-        if action_type in {"drag_and_drop", "select_area", "open_app"}:
+        if action_type in {"drag_and_drop", "select_area", "open_app", "focus_window"}:
             return True
 
-        if action_type in {"left_click", "right_click", "double_click", "key"}:
+        if action_type == "click_and_type":
+            return bool(action.get("submit", False))
+
+        if action_type in {"left_click", "right_click", "double_click", "click_element", "key"}:
             if action_type == "key":
                 combo = {str(k).lower() for k in action.get("keys") or []}
                 if combo.intersection({"enter", "return"}):
@@ -2134,23 +2170,12 @@ class Orchestrator:
         """Translate element_id to x/y (physical px) using the most recent overlay tags."""
         lookup: Dict[str, Dict[str, Any]] = {str(tag["id"]): tag for tag in tags}
 
-        def _apply(act: dict) -> bool:
-            if act.get("x") is not None and act.get("y") is not None:
-                return True
-            element_id = act.get("element_id")
-            if element_id is None:
-                return True
-            if not lookup:
-                return False
-            tag = lookup.get(str(element_id))
-            if not tag:
-                return False
+        def _annotate_from_tag(act: dict, tag: Dict[str, Any]) -> bool:
             frame = tag.get("frame") or {}
             try:
                 cx, cy = self._frame_center_px(frame)
                 act["x"] = cx
                 act["y"] = cy
-                # Enrich action with semantic hints for downstream skill generalization
                 if "semantic_role" not in act and tag.get("role"):
                     act["semantic_role"] = tag.get("role")
                 if "semantic_label" not in act and tag.get("label"):
@@ -2160,6 +2185,42 @@ class Orchestrator:
                 return True
             except Exception:
                 return False
+
+        def _apply(act: dict) -> bool:
+            if act.get("x") is not None and act.get("y") is not None:
+                return True
+
+            raw_element_id = act.get("element_id")
+            if raw_element_id is not None:
+                token = str(raw_element_id).strip()
+                if not token:
+                    return True
+                tag = lookup.get(token)
+                if tag:
+                    return _annotate_from_tag(act, tag)
+                if token.isdigit():
+                    # Numeric IDs are strict overlay references; treat miss as stale grounding.
+                    return False
+                fallback = self._match_tag_reference(token, tags)
+                if fallback:
+                    return _annotate_from_tag(act, fallback)
+                # Non-numeric IDs are semantic references; keep execution moving.
+                act.setdefault("element_ref", token)
+                return True
+
+            raw_ref = act.get("element_ref")
+            ref = str(raw_ref).strip() if raw_ref is not None else ""
+            if not ref:
+                return True
+            if ref.isdigit():
+                tag = lookup.get(ref)
+                if tag:
+                    return _annotate_from_tag(act, tag)
+                return False
+            matched = self._match_tag_reference(ref, tags)
+            if matched:
+                return _annotate_from_tag(act, matched)
+            return True
 
         if action.get("type") == "macro_actions":
             for sub in action.get("actions") or []:
@@ -2173,6 +2234,79 @@ class Orchestrator:
         cx = float(frame.get("x", 0)) + float(frame.get("w", 0)) / 2.0
         cy = float(frame.get("y", 0)) + float(frame.get("h", 0)) / 2.0
         return cx, cy
+
+    def _match_tag_reference(self, reference: str, tags: List[Dict[str, Any]]) -> Dict[str, Any] | None:
+        token = str(reference or "").strip().lower()
+        if not token or not tags:
+            return None
+
+        normalized = self._normalize_reference_token(token)
+        parts = [
+            self._normalize_reference_token(part)
+            for part in re.split(r"[^a-z0-9]+", token)
+            if part and len(part) > 1
+        ]
+        generic_parts = {
+            "btn",
+            "button",
+            "input",
+            "field",
+            "text",
+            "textbox",
+            "link",
+            "label",
+            "item",
+            "icon",
+            "window",
+            "pane",
+            "tab",
+            "menu",
+            "msg",
+            "message",
+            "element",
+        }
+        parts = [part for part in parts if part not in generic_parts]
+
+        best_tag: Dict[str, Any] | None = None
+        best_score = 0.0
+        for tag in tags:
+            role = str(tag.get("role") or "").lower()
+            label = str(tag.get("label") or "").lower()
+            path = str(tag.get("path") or "").lower()
+            blob = f"{role} {label} {path}".strip()
+            if not blob:
+                continue
+
+            score = 0.0
+            norm_blob = self._normalize_reference_token(blob)
+            if normalized and normalized in norm_blob:
+                score += 4.0
+            if token == label or token == path or token == role:
+                score += 6.0
+            if token in label:
+                score += 3.0
+            if token in path:
+                score += 2.0
+            if token in role:
+                score += 1.5
+
+            if parts:
+                matched_parts = 0
+                for part in parts:
+                    if part and part in norm_blob:
+                        score += 1.2
+                        matched_parts += 1
+                if matched_parts == len(parts):
+                    score += 2.0
+
+            if score > best_score:
+                best_score = score
+                best_tag = tag
+
+        return best_tag if best_score > 0.0 else None
+
+    def _normalize_reference_token(self, value: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
 
     def _refresh_grounding(self, state: StateManager) -> tuple[str, str, List[Dict[str, Any]], dict | None]:
         """

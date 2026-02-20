@@ -7,6 +7,7 @@ from urllib.parse import urlparse
 
 from cua_agent.agent.state_manager import VERIFICATION_SENSOR_HIERARCHY
 from cua_agent.computer.adapter import ComputerAdapter
+from cua_agent.computer.types import COMPUTER_ACTION_SPACE
 from cua_agent.utils.config import Settings
 from cua_agent.utils.logger import get_logger
 
@@ -31,33 +32,15 @@ COMPUTER_TOOL = {
     "function": {
         "name": "computer",
         "description": (
-            "Control the desktop: move and click the mouse, type, press hotkeys, "
-            "scroll, wait, request a screenshot, or inspect the UI tree."
+            "Control the desktop with low-level HID actions and high-level semantic actions "
+            "(click/fill/wait/scroll by element, clipboard, and window management)."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": [
-                        "move_mouse",
-                        "left_click",
-                        "right_click",
-                        "double_click",
-                        "drag_and_drop",
-                        "select_area",
-                        "hover",
-                        "probe_ui",
-                        "clipboard_op",
-                        "run_skill",
-                        "scroll",
-                        "type",
-                        "hotkey",
-                        "wait",
-                        "screenshot",
-                        "open_app",
-                        "inspect_ui",
-                    ],
+                    "enum": list(COMPUTER_ACTION_SPACE),
                 },
                 "actions": {
                     "type": "array",
@@ -66,7 +49,9 @@ COMPUTER_TOOL = {
                         "type": "object",
                         "properties": {
                             "action": {"type": "string"},
-                            "element_id": {"type": "integer"},
+                            "element_id": {
+                                "oneOf": [{"type": "integer"}, {"type": "string"}],
+                            },
                             "x": {"type": "number"},
                             "y": {"type": "number"},
                             "target_x": {"type": "number"},
@@ -82,6 +67,13 @@ COMPUTER_TOOL = {
                             "hold_delay": {"type": "number"},
                             "sub_action": {"type": "string", "enum": ["read", "write", "clear"]},
                             "content": {"type": "string"},
+                            "window_title": {"type": "string"},
+                            "timeout": {"type": "number"},
+                            "submit": {"type": "boolean"},
+                            "clear": {"type": "boolean"},
+                            "paste": {"type": "boolean"},
+                            "capture_selection": {"type": "boolean"},
+                            "click_type": {"type": "string", "enum": ["left", "right", "double"]},
                             "phantom_mode": {"type": "boolean"},
                             "verify_after": {"type": "boolean"},
                             "verification": {
@@ -145,12 +137,18 @@ COMPUTER_TOOL = {
                     "description": "Hotkey combo, e.g. ['ctrl','s'].",
                 },
                 "element_id": {
-                    "type": "integer",
-                    "description": "ID from the numbered overlay tag. Prefer this over raw coordinates when marks are present.",
+                    "oneOf": [{"type": "integer"}, {"type": "string"}],
+                    "description": (
+                        "Element reference. Can be a numbered overlay ID or semantic identifier token."
+                    ),
                 },
                 "seconds": {
                     "type": "number",
                     "description": "Seconds to wait for the 'wait' action.",
+                },
+                "timeout": {
+                    "type": "number",
+                    "description": "Timeout in seconds for semantic waits (wait_for_element/wait_for_idle).",
                 },
                 "duration": {
                     "type": "number",
@@ -168,6 +166,31 @@ COMPUTER_TOOL = {
                 "content": {
                     "type": "string",
                     "description": "Content to write to clipboard.",
+                },
+                "window_title": {
+                    "type": "string",
+                    "description": "Window title substring used by focus_window.",
+                },
+                "submit": {
+                    "type": "boolean",
+                    "description": "If true, send Enter after text entry in click_and_type.",
+                },
+                "clear": {
+                    "type": "boolean",
+                    "description": "If true, clear field content before typing in fill_field/click_and_type.",
+                },
+                "paste": {
+                    "type": "boolean",
+                    "description": "If true, paste after write_clipboard (Ctrl/Cmd+V).",
+                },
+                "capture_selection": {
+                    "type": "boolean",
+                    "description": "If true, run select-all/copy before read_clipboard.",
+                },
+                "click_type": {
+                    "type": "string",
+                    "enum": ["left", "right", "double"],
+                    "description": "Mouse click variant used by click_element.",
                 },
                 "phantom_mode": {
                     "type": "boolean",
@@ -898,15 +921,16 @@ class CognitiveCore:
         return self._map_single_computer_action(args)
 
     def _map_single_computer_action(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        action = args.get("action")
+        action = str(args.get("action") or "").strip()
+        action_l = action.lower()
         verify_after = args.get("verify_after")
-        
+
         def _apply_verify(payload: Dict[str, Any]) -> Dict[str, Any]:
             if verify_after is not None:
                 payload["verify_after"] = bool(verify_after)
             contract = self._normalize_verification_contract(
                 args.get("verification"),
-                fallback_sensor=self._default_sensor_for_action_type(str(action or "")),
+                fallback_sensor=self._default_sensor_for_action_type(action_l),
                 verify_after=verify_after,
             )
             if contract:
@@ -915,16 +939,33 @@ class CognitiveCore:
             if rationale:
                 payload["_debug_rationale"] = str(rationale)[:600]
             return payload
-        
-        # Common phantom_mode handling for click/hover actions
-        phantom_mode = args.get("phantom_mode", False)
-        
-        if action == "move_mouse":
+
+        def _overlay_element_id() -> int | None:
+            raw = args.get("element_id")
+            if isinstance(raw, int) and not isinstance(raw, bool):
+                return int(raw)
+            token = str(raw).strip() if raw is not None else ""
+            if token.isdigit():
+                return int(token)
+            return None
+
+        def _semantic_ref() -> str:
+            for key in ("element_ref", "element_id"):
+                raw = args.get(key)
+                token = str(raw).strip() if raw is not None else ""
+                if token:
+                    return token
+            return ""
+
+        phantom_mode = args.get("phantom_mode")
+
+        if action_l == "move_mouse":
             x = args.get("x")
             y = args.get("y")
             payload = {"type": "mouse_move"}
-            if args.get("element_id") is not None:
-                payload["element_id"] = args.get("element_id")
+            overlay_id = _overlay_element_id()
+            if overlay_id is not None:
+                payload["element_id"] = overlay_id
             if x is None or y is None:
                 if "element_id" in payload:
                     return _apply_verify(payload)
@@ -933,38 +974,38 @@ class CognitiveCore:
             payload["y"] = float(y)
             return _apply_verify(payload)
 
-        if action in ("left_click", "right_click", "double_click"):
-            payload = {"type": action}
-            if args.get("element_id") is not None:
-                payload["element_id"] = args.get("element_id")
+        if action_l in ("left_click", "right_click", "double_click"):
+            payload = {"type": action_l}
+            overlay_id = _overlay_element_id()
+            if overlay_id is not None:
+                payload["element_id"] = overlay_id
             if args.get("x") is not None and args.get("y") is not None:
                 payload["x"] = float(args.get("x"))
                 payload["y"] = float(args.get("y"))
-            if phantom_mode:
-                payload["phantom_mode"] = True
+            if phantom_mode is not None:
+                payload["phantom_mode"] = bool(phantom_mode)
             return _apply_verify(payload)
 
-        if action == "drag_and_drop":
+        if action_l == "drag_and_drop":
             payload = {"type": "drag_and_drop"}
-            # Source
-            if args.get("element_id") is not None:
-                payload["element_id"] = args.get("element_id")
+            overlay_id = _overlay_element_id()
+            if overlay_id is not None:
+                payload["element_id"] = overlay_id
             if args.get("x") is not None and args.get("y") is not None:
                 payload["x"] = float(args.get("x"))
                 payload["y"] = float(args.get("y"))
-            
-            # Destination
+
             if args.get("target_x") is not None and args.get("target_y") is not None:
                 payload["target_x"] = float(args.get("target_x"))
                 payload["target_y"] = float(args.get("target_y"))
             else:
                 return {"type": "noop", "reason": "drag_and_drop missing target coordinates"}
-            
+
             payload["duration"] = float(args.get("duration", 0.5))
             payload["hold_delay"] = float(args.get("hold_delay", 0.0))
             return _apply_verify(payload)
-        
-        if action == "select_area":
+
+        if action_l == "select_area":
             payload = {"type": "select_area"}
             if args.get("x") is not None and args.get("y") is not None:
                 payload["x"] = float(args.get("x"))
@@ -978,17 +1019,18 @@ class CognitiveCore:
             payload["hold_delay"] = float(args.get("hold_delay", 0.0))
             return _apply_verify(payload)
 
-        if action == "hover":
+        if action_l == "hover":
             payload = {"type": "hover"}
-            if args.get("element_id") is not None:
-                payload["element_id"] = args.get("element_id")
+            overlay_id = _overlay_element_id()
+            if overlay_id is not None:
+                payload["element_id"] = overlay_id
             if args.get("x") is not None and args.get("y") is not None:
                 payload["x"] = float(args.get("x"))
                 payload["y"] = float(args.get("y"))
             payload["duration"] = float(args.get("duration", 1.0))
             return _apply_verify(payload)
 
-        if action == "probe_ui":
+        if action_l == "probe_ui":
             payload = {"type": "probe_ui"}
             if args.get("x") is not None and args.get("y") is not None:
                 payload["x"] = float(args.get("x"))
@@ -997,7 +1039,7 @@ class CognitiveCore:
                 payload["radius"] = float(args.get("radius"))
             return _apply_verify(payload)
 
-        if action == "clipboard_op":
+        if action_l == "clipboard_op":
             sub = args.get("sub_action")
             if not sub:
                 return {"type": "noop", "reason": "clipboard_op missing sub_action"}
@@ -1006,33 +1048,148 @@ class CognitiveCore:
                 payload["content"] = args.get("content", "")
             return _apply_verify(payload)
 
-        if action == "scroll":
+        if action_l == "scroll":
             return _apply_verify({
-                "type": "scroll", 
+                "type": "scroll",
                 "clicks": int(args.get("scroll_y", 0)),
-                "axis": args.get("axis", "vertical")
+                "axis": args.get("axis", "vertical"),
             })
-        if action == "type":
+        if action_l == "type":
             payload = {"type": "type", "text": args.get("text", "")}
-            if args.get("element_id") is not None:
-                payload["element_id"] = args.get("element_id")
-            if args.get("phantom_mode") is not None:
-                payload["phantom_mode"] = bool(args.get("phantom_mode"))
-            # If the model provided an element_id but no explicit phantom flag, default to phantom for reliability.
-            if args.get("element_id") is not None and args.get("phantom_mode") is None:
+            overlay_id = _overlay_element_id()
+            if overlay_id is not None:
+                payload["element_id"] = overlay_id
+            if phantom_mode is not None:
+                payload["phantom_mode"] = bool(phantom_mode)
+            if overlay_id is not None and phantom_mode is None:
                 payload["phantom_mode"] = True
             return _apply_verify(payload)
-        if action == "hotkey":
+
+        if action_l == "click_element":
+            payload: Dict[str, Any] = {"type": "click_element"}
+            semantic_ref = _semantic_ref()
+            if semantic_ref:
+                payload["element_ref"] = semantic_ref
+            if args.get("x") is not None and args.get("y") is not None:
+                payload["x"] = float(args.get("x"))
+                payload["y"] = float(args.get("y"))
+            click_type = str(args.get("click_type") or "left").strip().lower()
+            if click_type in {"left", "right", "double"}:
+                payload["click_type"] = click_type
+            payload["phantom_mode"] = bool(args.get("phantom_mode", True))
+            if "element_ref" not in payload and "x" not in payload:
+                return {"type": "noop", "reason": "click_element missing element_id or coordinates"}
+            return _apply_verify(payload)
+
+        if action_l == "fill_field":
+            text = str(args.get("text") or "")
+            if not text:
+                return {"type": "noop", "reason": "fill_field missing text"}
+            payload = {
+                "type": "fill_field",
+                "text": text,
+                "clear": bool(args.get("clear", True)),
+                "phantom_mode": bool(args.get("phantom_mode", True)),
+            }
+            semantic_ref = _semantic_ref()
+            if semantic_ref:
+                payload["element_ref"] = semantic_ref
+            if args.get("x") is not None and args.get("y") is not None:
+                payload["x"] = float(args.get("x"))
+                payload["y"] = float(args.get("y"))
+            if "element_ref" not in payload and "x" not in payload:
+                return {"type": "noop", "reason": "fill_field missing element_id or coordinates"}
+            return _apply_verify(payload)
+
+        if action_l == "wait_for_element":
+            payload = {"type": "wait_for_element", "timeout": float(args.get("timeout", args.get("seconds", 10)))}
+            semantic_ref = _semantic_ref()
+            if semantic_ref:
+                payload["element_ref"] = semantic_ref
+            if args.get("x") is not None and args.get("y") is not None:
+                payload["x"] = float(args.get("x"))
+                payload["y"] = float(args.get("y"))
+            if "element_ref" not in payload:
+                return {"type": "noop", "reason": "wait_for_element requires element_id/element_ref"}
+            return _apply_verify(payload)
+
+        if action_l == "wait_for_idle":
+            return _apply_verify({"type": "wait_for_idle", "timeout": float(args.get("timeout", args.get("seconds", 10)))})
+
+        if action_l == "scroll_to_element":
+            payload = {
+                "type": "scroll_to_element",
+                "timeout": float(args.get("timeout", 10)),
+                "max_scrolls": int(args.get("max_scrolls", 24)),
+                "clicks": int(args.get("scroll_y", -8)),
+                "axis": str(args.get("axis", "vertical")),
+            }
+            semantic_ref = _semantic_ref()
+            if semantic_ref:
+                payload["element_ref"] = semantic_ref
+            if args.get("x") is not None and args.get("y") is not None:
+                payload["x"] = float(args.get("x"))
+                payload["y"] = float(args.get("y"))
+            if "element_ref" not in payload:
+                return {"type": "noop", "reason": "scroll_to_element requires element_id/element_ref"}
+            return _apply_verify(payload)
+
+        if action_l == "read_clipboard":
+            payload = {"type": "clipboard_op", "sub_action": "read"}
+            if args.get("capture_selection") is not None:
+                payload["capture_selection"] = bool(args.get("capture_selection"))
+            return _apply_verify(payload)
+
+        if action_l == "write_clipboard":
+            content = args.get("text")
+            if content is None:
+                content = args.get("content", "")
+            payload = {
+                "type": "clipboard_op",
+                "sub_action": "write",
+                "content": str(content),
+                "paste": bool(args.get("paste", True)),
+            }
+            return _apply_verify(payload)
+
+        if action_l == "focus_window":
+            window_title = str(args.get("window_title") or "").strip()
+            if not window_title:
+                return {"type": "noop", "reason": "focus_window missing window_title"}
+            return _apply_verify({"type": "focus_window", "window_title": window_title})
+
+        if action_l == "click_and_type":
+            text = str(args.get("text") or "")
+            if not text:
+                return {"type": "noop", "reason": "click_and_type missing text"}
+            payload = {
+                "type": "click_and_type",
+                "text": text,
+                "clear": bool(args.get("clear", True)),
+                "submit": bool(args.get("submit", True)),
+                "phantom_mode": bool(args.get("phantom_mode", True)),
+            }
+            semantic_ref = _semantic_ref()
+            if semantic_ref:
+                payload["element_ref"] = semantic_ref
+            if args.get("x") is not None and args.get("y") is not None:
+                payload["x"] = float(args.get("x"))
+                payload["y"] = float(args.get("y"))
+            if "element_ref" not in payload and "x" not in payload:
+                return {"type": "noop", "reason": "click_and_type missing element_id or coordinates"}
+            return _apply_verify(payload)
+
+        if action_l == "hotkey":
             return _apply_verify({"type": "key", "keys": args.get("keys") or []})
-        if action == "wait":
+        if action_l == "wait":
             return _apply_verify({"type": "wait", "seconds": float(args.get("seconds", 1))})
-        if action == "screenshot":
+        if action_l == "screenshot":
             return _apply_verify({"type": "capture_only", "reason": "model requested screenshot"})
-        if action == "open_app":
+        if action_l == "open_app":
             return _apply_verify({"type": "open_app", "app_name": args.get("app_name", "")})
-        if action == "inspect_ui":
+        if action_l == "inspect_ui":
             return _apply_verify({"type": "inspect_ui"})
-        if action == "run_skill":
+        if action_l == "run_skill":
             payload = {
                 "type": "run_skill",
                 "skill_id": args.get("skill_id"),
@@ -1048,17 +1205,39 @@ class CognitiveCore:
                     payload["skill_args"] = cleaned_args
             return _apply_verify(payload)
 
-        return {"type": "noop", "reason": f"unknown action {action}"}
+        return {"type": "noop", "reason": f"unknown action {action_l}"}
 
     def _default_sensor_for_action_type(self, action_type: str) -> str:
         token = str(action_type or "").strip().lower()
-        if token in {"wait", "screenshot", "inspect_ui", "probe_ui"}:
+        if token in {
+            "wait",
+            "wait_for_element",
+            "wait_for_idle",
+            "screenshot",
+            "inspect_ui",
+            "probe_ui",
+            "read_clipboard",
+            "scroll_to_element",
+        }:
             return "none"
-        if token in {"clipboard_op", "open_app"}:
+        if token in {"clipboard_op", "write_clipboard", "open_app", "focus_window"}:
             return "os_telemetry"
         if token in {"move_mouse", "hover", "scroll"}:
             return "none"
-        if token in {"run_skill", "drag_and_drop", "select_area", "left_click", "right_click", "double_click", "hotkey", "key", "type"}:
+        if token in {
+            "run_skill",
+            "drag_and_drop",
+            "select_area",
+            "left_click",
+            "right_click",
+            "double_click",
+            "click_element",
+            "fill_field",
+            "click_and_type",
+            "hotkey",
+            "key",
+            "type",
+        }:
             return "a11y_tree"
         return "pixel_diff"
 

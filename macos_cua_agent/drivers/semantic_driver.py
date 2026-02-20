@@ -20,6 +20,10 @@ class SemanticDriver(BaseSemanticDriver):
         command = action.get("command")
         if command == "focus_app":
             return self._focus_app(action.get("app_name") or action.get("app"))
+        if command == "focus_window":
+            return self._focus_window(action.get("window_title"))
+        if command == "open_app":
+            return self._open_app(action.get("app_name") or action.get("app"))
         if command == "insert_text_at_cursor":
             return self._insert_text(action.get("text", ""))
         if command == "save_document":
@@ -38,6 +42,61 @@ class SemanticDriver(BaseSemanticDriver):
         end run
         """
         return self._run_osascript(script, f"focus {app_name}", [app_name])
+
+    def _focus_window(self, window_title: Optional[str]) -> ActionResult:
+        if not window_title:
+            return ActionResult(success=False, reason="window_title required for focus_window")
+        token = window_title.strip()
+        if not token:
+            return ActionResult(success=False, reason="window_title required for focus_window")
+
+        script = """
+        on run argv
+            set targetTitle to item 1 of argv
+            tell application "System Events"
+                set procList to application processes whose background only is false
+                repeat with procRef in procList
+                    try
+                        set procName to name of procRef
+                        set winList to windows of procRef
+                        repeat with winRef in winList
+                            try
+                                set winName to name of winRef
+                                if winName contains targetTitle then
+                                    tell application procName to activate
+                                    return procName
+                                end if
+                            end try
+                        end repeat
+                    end try
+                end repeat
+            end tell
+            error "window not found"
+        end run
+        """
+        return self._run_osascript(script, f"focus_window {token}", [token])
+
+    def _open_app(self, app_name: Optional[str]) -> ActionResult:
+        if not app_name:
+            return ActionResult(success=False, reason="app_name required for open_app")
+        token = app_name.strip()
+        if not token:
+            return ActionResult(success=False, reason="app_name required for open_app")
+        try:
+            completed = subprocess.run(
+                ["open", "-a", token],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if completed.returncode == 0:
+                return ActionResult(success=True, reason=f"opened {token}")
+            return ActionResult(
+                success=False,
+                reason=f"open_app failed: {completed.stderr.strip() or completed.stdout.strip()}",
+            )
+        except Exception as exc:
+            return ActionResult(success=False, reason=f"open_app exception: {exc}")
 
     def _insert_text(self, text: str) -> ActionResult:
         if not text:

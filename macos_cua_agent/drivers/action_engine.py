@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import re
 import subprocess
@@ -70,10 +71,25 @@ class ActionEngine:
             seconds = float(action.get("seconds", 1))
             time.sleep(seconds)
             return ActionResult(success=True, reason=f"waited {seconds} seconds")
+        if action.get("type") == "wait_for_idle":
+            return self._wait_for_idle(action)
 
         self.logger.info("Executing action via %s: %s", action.get("execution", "hid"), action)
         execution_path = action.get("execution", "hid")
         action_type = action.get("type")
+
+        if action_type == "click_element":
+            return self._click_element(action)
+        if action_type == "fill_field":
+            return self._fill_field(action)
+        if action_type == "wait_for_element":
+            return self._wait_for_element(action)
+        if action_type == "scroll_to_element":
+            return self._scroll_to_element(action)
+        if action_type == "focus_window":
+            return self._focus_window(action)
+        if action_type == "click_and_type":
+            return self._click_and_type(action)
 
         if action_type == "inspect_ui":
             ax_res = self.accessibility_driver.get_active_window_tree()
@@ -205,10 +221,326 @@ class ActionEngine:
             reason = f"{reason} (after AX failure: {ax_reason})"
         return ActionResult(success=True, reason=reason, metadata=metadata)
 
+    def _click_element(self, action: dict) -> ActionResult:
+        target, reason = self._resolve_semantic_target(action, allow_coordinate_fallback=True)
+        if not target:
+            return ActionResult(success=False, reason=reason or "click_element target not found")
+
+        click_type = str(action.get("click_type") or "left").strip().lower()
+        action_type = {
+            "left": "left_click",
+            "right": "right_click",
+            "double": "double_click",
+        }.get(click_type, "left_click")
+        payload = {
+            "type": action_type,
+            "x": target["x"],
+            "y": target["y"],
+            "phantom_mode": bool(action.get("phantom_mode", True)),
+            "semantic_role": target.get("semantic_role", ""),
+            "semantic_label": target.get("semantic_label", ""),
+            "semantic_path": target.get("semantic_path", ""),
+        }
+        result = self._execute_hid(payload)
+        if result.success:
+            metadata = dict(result.metadata or {})
+            metadata["target"] = target
+            return ActionResult(success=True, reason=result.reason or "clicked element", metadata=metadata)
+        return result
+
+    def _fill_field(self, action: dict) -> ActionResult:
+        text = str(action.get("text") or "")
+        if not text:
+            return ActionResult(success=False, reason="fill_field requires text")
+
+        target, reason = self._resolve_semantic_target(action, allow_coordinate_fallback=True)
+        if not target:
+            return ActionResult(success=False, reason=reason or "fill_field target not found")
+
+        x = target["x"]
+        y = target["y"]
+        phantom_mode = bool(action.get("phantom_mode", True))
+        clear_first = bool(action.get("clear", True))
+
+        if phantom_mode:
+            set_res = self.accessibility_driver.set_text_element_value(x, y, text)
+            if set_res.success:
+                metadata = dict(set_res.metadata or {})
+                metadata["target"] = target
+                return ActionResult(success=True, reason="filled field via accessibility API", metadata=metadata)
+
+        focus_res = self._execute_hid(
+            {
+                "type": "left_click",
+                "x": x,
+                "y": y,
+                "phantom_mode": phantom_mode,
+                "semantic_role": target.get("semantic_role", ""),
+                "semantic_label": target.get("semantic_label", ""),
+                "semantic_path": target.get("semantic_path", ""),
+            }
+        )
+        if not focus_res.success:
+            return focus_res
+
+        if clear_first:
+            select_res = self.hid_driver.press_keys([self._primary_modifier_key(), "a"])
+            if not select_res.success:
+                return ActionResult(success=False, reason=f"fill_field failed to select all: {select_res.reason}")
+            backspace_res = self.hid_driver.press_keys(["backspace"])
+            if not backspace_res.success:
+                return ActionResult(success=False, reason=f"fill_field failed to clear text: {backspace_res.reason}")
+
+        type_res = self.hid_driver.type_text(text)
+        if not type_res.success:
+            return type_res
+        return ActionResult(success=True, reason="filled field", metadata={"target": target})
+
+    def _click_and_type(self, action: dict) -> ActionResult:
+        text = str(action.get("text") or "")
+        if not text:
+            return ActionResult(success=False, reason="click_and_type requires text")
+
+        target, reason = self._resolve_semantic_target(action, allow_coordinate_fallback=True)
+        if not target:
+            return ActionResult(success=False, reason=reason or "click_and_type target not found")
+
+        click_res = self._execute_hid(
+            {
+                "type": "left_click",
+                "x": target["x"],
+                "y": target["y"],
+                "phantom_mode": bool(action.get("phantom_mode", True)),
+                "semantic_role": target.get("semantic_role", ""),
+                "semantic_label": target.get("semantic_label", ""),
+                "semantic_path": target.get("semantic_path", ""),
+            }
+        )
+        if not click_res.success:
+            return click_res
+
+        if bool(action.get("clear", True)):
+            select_res = self.hid_driver.press_keys([self._primary_modifier_key(), "a"])
+            if not select_res.success:
+                return ActionResult(success=False, reason=f"click_and_type failed to select all: {select_res.reason}")
+            backspace_res = self.hid_driver.press_keys(["backspace"])
+            if not backspace_res.success:
+                return ActionResult(success=False, reason=f"click_and_type failed to clear text: {backspace_res.reason}")
+
+        type_res = self.hid_driver.type_text(text)
+        if not type_res.success:
+            return type_res
+
+        if bool(action.get("submit", True)):
+            submit_res = self.hid_driver.press_keys(["enter"])
+            if not submit_res.success:
+                return ActionResult(success=False, reason=f"click_and_type failed to submit: {submit_res.reason}")
+
+        return ActionResult(success=True, reason="click_and_type complete", metadata={"target": target})
+
+    def _wait_for_element(self, action: dict) -> ActionResult:
+        timeout = max(0.1, float(action.get("timeout", 10.0)))
+        deadline = time.time() + timeout
+        last_reason = "element not found"
+
+        while time.time() <= deadline:
+            target, reason = self._resolve_semantic_target(action, allow_coordinate_fallback=False)
+            if target:
+                return ActionResult(success=True, reason="element found", metadata={"target": target})
+            if reason:
+                last_reason = reason
+            time.sleep(0.2)
+
+        return ActionResult(success=False, reason=f"wait_for_element timeout: {last_reason}")
+
+    def _wait_for_idle(self, action: dict) -> ActionResult:
+        timeout = max(0.1, float(action.get("timeout", 10.0)))
+        deadline = time.time() + timeout
+        stable_required = 3
+        stable_count = 0
+
+        prev_frame = None
+        if self.vision_pipeline:
+            try:
+                prev_frame = self.vision_pipeline.capture_base64()
+            except Exception:
+                prev_frame = None
+        prev_ax_sig = self._capture_ax_signature()
+
+        if prev_frame is None and prev_ax_sig is None:
+            time.sleep(min(0.3, timeout))
+            return ActionResult(success=True, reason="wait_for_idle skipped (no sensors)")
+
+        while time.time() <= deadline:
+            time.sleep(0.2)
+            changed = False
+
+            if self.vision_pipeline and prev_frame is not None:
+                try:
+                    frame = self.vision_pipeline.capture_base64()
+                    if self.vision_pipeline.has_changed(prev_frame, frame, threshold=0.002):
+                        changed = True
+                    prev_frame = frame
+                except Exception:
+                    pass
+
+            ax_sig = self._capture_ax_signature()
+            if prev_ax_sig is not None and ax_sig is not None and ax_sig != prev_ax_sig:
+                changed = True
+            if ax_sig is not None:
+                prev_ax_sig = ax_sig
+
+            if changed:
+                stable_count = 0
+            else:
+                stable_count += 1
+                if stable_count >= stable_required:
+                    return ActionResult(success=True, reason="ui reached idle state")
+
+        return ActionResult(success=False, reason="wait_for_idle timeout")
+
+    def _scroll_to_element(self, action: dict) -> ActionResult:
+        max_scrolls = max(1, int(action.get("max_scrolls", 24)))
+        timeout = max(0.1, float(action.get("timeout", 10.0)))
+        clicks = int(action.get("clicks", -8))
+        axis = str(action.get("axis", "vertical") or "vertical")
+        deadline = time.time() + timeout
+        last_reason = "element not found"
+
+        attempts = 0
+        while time.time() <= deadline:
+            target, reason = self._resolve_semantic_target(action, allow_coordinate_fallback=False)
+            if target:
+                return ActionResult(
+                    success=True,
+                    reason="element is visible",
+                    metadata={"target": target, "scroll_attempts": attempts},
+                )
+            if reason:
+                last_reason = reason
+            if attempts >= max_scrolls:
+                break
+
+            scroll_res = self.hid_driver.scroll(clicks, axis=axis)
+            if not scroll_res.success:
+                return ActionResult(success=False, reason=f"scroll_to_element failed: {scroll_res.reason}")
+            attempts += 1
+            time.sleep(0.12)
+
+        return ActionResult(success=False, reason=f"scroll_to_element timeout: {last_reason}")
+
+    def _focus_window(self, action: dict) -> ActionResult:
+        title = str(action.get("window_title") or "").strip()
+        if not title:
+            return ActionResult(success=False, reason="focus_window requires window_title")
+
+        if self.settings.enable_semantic:
+            res = self.semantic_driver.execute({"command": "focus_window", "window_title": title})
+            if res.success:
+                return res
+            fallback = self.semantic_driver.execute({"command": "focus_app", "app_name": title})
+            if fallback.success:
+                return fallback
+            return ActionResult(success=False, reason=f"focus_window failed: {res.reason}")
+
+        return ActionResult(success=False, reason="semantic driver disabled for focus_window")
+
+    def _resolve_semantic_target(
+        self,
+        action: dict,
+        *,
+        allow_coordinate_fallback: bool,
+        max_depth: int = 5,
+    ) -> tuple[dict | None, str]:
+        anchor_x = self._as_float(action.get("x"))
+        anchor_y = self._as_float(action.get("y"))
+        hint_role = (action.get("semantic_role") or action.get("role") or "").strip()
+        hint_label = (action.get("semantic_label") or action.get("label") or "").strip()
+        hint_path = (action.get("semantic_path") or action.get("path") or "").strip()
+        element_ref = str(action.get("element_ref") or action.get("element_id") or "").strip()
+
+        ax_res = self.accessibility_driver.get_active_window_tree(max_depth=max_depth)
+        if ax_res.success:
+            ax_tree = (ax_res.metadata or {}).get("tree")
+            if ax_tree:
+                nodes = flatten_nodes_with_frames(ax_tree, max_nodes=200)
+                if nodes:
+                    best = self._pick_semantic_node(
+                        nodes,
+                        hint_role,
+                        hint_label,
+                        hint_path,
+                        anchor_x,
+                        anchor_y,
+                        element_ref=element_ref,
+                    )
+                    if best:
+                        frame = best.get("frame") or {}
+                        try:
+                            cx = float(frame.get("x", 0)) + float(frame.get("w", 0)) / 2.0
+                            cy = float(frame.get("y", 0)) + float(frame.get("h", 0)) / 2.0
+                            return {
+                                "x": cx,
+                                "y": cy,
+                                "semantic_role": best.get("role", ""),
+                                "semantic_label": best.get("label", ""),
+                                "semantic_path": best.get("path", ""),
+                            }, ""
+                        except Exception:
+                            pass
+                reason = "semantic target not found in accessibility tree"
+            else:
+                reason = "accessibility tree missing"
+        else:
+            reason = ax_res.reason or "accessibility tree unavailable"
+
+        if allow_coordinate_fallback and anchor_x is not None and anchor_y is not None:
+            return {
+                "x": anchor_x,
+                "y": anchor_y,
+                "semantic_role": hint_role,
+                "semantic_label": hint_label or element_ref,
+                "semantic_path": hint_path,
+            }, reason
+        return None, reason
+
+    def _capture_ax_signature(self) -> str | None:
+        if not self.settings.enable_semantic:
+            return None
+        ax_res = self.accessibility_driver.get_active_window_tree(max_depth=4)
+        if not ax_res.success:
+            return None
+        tree = (ax_res.metadata or {}).get("tree")
+        if not tree:
+            return None
+        try:
+            return json.dumps(tree, sort_keys=True, ensure_ascii=False)
+        except Exception:
+            return None
+
+    def _primary_modifier_key(self) -> str:
+        return "command"
+
+    def _as_float(self, value: object) -> float | None:
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
     def _handle_clipboard(self, action: dict) -> ActionResult:
         sub = action.get("sub_action")
         try:
             if sub == "read":
+                if action.get("capture_selection"):
+                    select_res = self.hid_driver.press_keys([self._primary_modifier_key(), "a"])
+                    if not select_res.success:
+                        return ActionResult(success=False, reason=f"clipboard capture failed: {select_res.reason}")
+                    copy_res = self.hid_driver.press_keys([self._primary_modifier_key(), "c"])
+                    if not copy_res.success:
+                        return ActionResult(success=False, reason=f"clipboard capture failed: {copy_res.reason}")
+                    time.sleep(0.08)
                 content = subprocess.check_output(["pbpaste"]).decode("utf-8")
                 sensitive, redacted = self._redact_clipboard_content(content)
                 return ActionResult(
@@ -219,6 +551,11 @@ class ActionEngine:
             elif sub == "write":
                 content = action.get("content", "")
                 subprocess.run(["pbcopy"], input=content.encode("utf-8"), check=True)
+                if action.get("paste"):
+                    paste_res = self.hid_driver.press_keys([self._primary_modifier_key(), "v"])
+                    if not paste_res.success:
+                        return ActionResult(success=False, reason=f"clipboard paste failed: {paste_res.reason}")
+                    return ActionResult(success=True, reason="wrote to clipboard and pasted")
                 return ActionResult(success=True, reason="wrote to clipboard")
             elif sub == "clear":
                 subprocess.run(["pbcopy"], input=b"", check=True)
@@ -381,8 +718,10 @@ class ActionEngine:
             app_name = action.get("app_name", "")
             self.logger.info("Executing open_app for: %s", app_name)
 
-            # 1. Try Semantic Focus first (AppleScript)
             if self.settings.enable_semantic:
+                res = self.semantic_driver.execute({"command": "open_app", "app_name": app_name})
+                if res.success:
+                    return res
                 res = self.semantic_driver.execute({"command": "focus_app", "app_name": app_name})
                 if res.success:
                     focused = self.accessibility_driver.get_focused_app_name()
@@ -683,6 +1022,8 @@ class ActionEngine:
         hint_path: str,
         anchor_x: float | None,
         anchor_y: float | None,
+        *,
+        element_ref: str = "",
     ) -> dict | None:
         """
         Score nodes by semantic closeness (role/label) and optionally distance to prior coordinates.
@@ -694,11 +1035,37 @@ class ActionEngine:
         hint_role_l = hint_role.lower()
         hint_label_l = hint_label.lower()
         hint_path_l = hint_path.lower()
+        element_ref_l = str(element_ref or "").strip().lower()
+
+        ref_tokens = [token for token in re.split(r"[^a-z0-9]+", element_ref_l) if len(token) > 1]
+        generic_ref_tokens = {
+            "btn",
+            "button",
+            "input",
+            "field",
+            "text",
+            "textbox",
+            "link",
+            "label",
+            "item",
+            "icon",
+            "element",
+            "window",
+            "pane",
+            "tab",
+            "menu",
+            "msg",
+            "message",
+        }
+        ref_tokens = [token for token in ref_tokens if token not in generic_ref_tokens]
+        element_ref_norm = re.sub(r"[^a-z0-9]+", "", element_ref_l)
 
         for node in nodes:
             role = (node.get("role") or "").lower()
             label = (node.get("label") or "").lower()
             node_path = (node.get("path") or "").lower()
+            combined = f"{role} {label} {node_path}".strip()
+            combined_norm = re.sub(r"[^a-z0-9]+", "", combined)
             score = 0.0
 
             if hint_role_l:
@@ -718,6 +1085,26 @@ class ActionEngine:
                     score += 5.0
                 elif hint_path_l in node_path:
                     score += 3.0
+
+            if element_ref_l:
+                if element_ref_l in {role, label, node_path}:
+                    score += 6.0
+                if element_ref_l in label:
+                    score += 3.0
+                if element_ref_l in node_path:
+                    score += 2.5
+                if element_ref_l in role:
+                    score += 1.5
+                if element_ref_norm and element_ref_norm in combined_norm:
+                    score += 2.5
+                if ref_tokens:
+                    matched = 0
+                    for token in ref_tokens:
+                        if token in combined_norm:
+                            score += 1.2
+                            matched += 1
+                    if matched == len(ref_tokens):
+                        score += 2.0
 
             if score <= 0:
                 continue
