@@ -44,6 +44,12 @@ class Settings:
     max_wall_clock_seconds: int | None = (
         int(os.getenv("MAX_WALL_CLOCK_SECONDS", "0")) or None
     )
+    autonomy_level: str = os.getenv("AUTONOMY_LEVEL", "confirm_risky")
+    max_recovery_attempts_per_step: int = int(os.getenv("MAX_RECOVERY_ATTEMPTS_PER_STEP", "3"))
+    max_replans_per_task: int = int(os.getenv("MAX_REPLANS_PER_TASK", "4"))
+    max_same_target_failures: int = int(os.getenv("MAX_SAME_TARGET_FAILURES", "2"))
+    force_visual_every_n_turns: int = int(os.getenv("FORCE_VISUAL_EVERY_N_TURNS", "3"))
+    min_grounding_confidence: float = float(os.getenv("MIN_GROUNDING_CONFIDENCE", "0.55"))
 
     enable_hid: bool = _get_bool("ENABLE_HID", False)
     enable_semantic: bool = _get_bool("ENABLE_SEMANTIC", True)
@@ -115,6 +121,11 @@ class Settings:
         if profile not in {"local_gui", "remote_cli", "hybrid"}:
             profile = "hybrid"
         self.execution_profile = profile
+
+        autonomy = (self.autonomy_level or "").strip().lower()
+        if autonomy not in {"supervised", "confirm_risky", "fully_autonomous"}:
+            autonomy = "confirm_risky"
+        self.autonomy_level = autonomy
 
         # Dynamically load OpenRouter settings
         if self.openrouter_api_key is None:

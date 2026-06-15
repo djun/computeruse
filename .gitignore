@@ -10,3 +10,4 @@ __pycache__/
 /*/.agent_memory
 /*/.agent_shell
 /.agent_shell/
+.DS_Store

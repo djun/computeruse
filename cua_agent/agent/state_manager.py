@@ -8,7 +8,10 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from cua_agent.orchestrator.react_types import GroundingBundle, ReActTurn
 
 VERIFICATION_SENSOR_HIERARCHY: tuple[str, ...] = (
     "none",
@@ -51,7 +54,14 @@ class Observation:
     changed_since_last: bool = False
     note: str = ""
     phash: str | None = None
+    visual_hash: str | None = None
     hash_distance: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.visual_hash is None and self.phash is not None:
+            self.visual_hash = self.phash
+        if self.phash is None and self.visual_hash is not None:
+            self.phash = self.visual_hash
 
 
 @dataclass
@@ -80,6 +90,9 @@ class StateManager:
         self.actions: List[Dict[str, Any]] = []
         self.observations: List[Observation] = []
         self.notebook: List[Note] = []
+        self.turns: List["ReActTurn"] = []
+        self.event_log: List[Dict[str, Any]] = []
+        self.last_grounding: "GroundingBundle | None" = None
         self.failure_count = 0
         self.steps = 0
         self.started_at = time.time()
@@ -143,6 +156,7 @@ class StateManager:
         changed: bool,
         note: str = "",
         phash: str | None = None,
+        visual_hash: str | None = None,
         hash_distance: int | None = None,
     ) -> Observation:
         # Offload image to disk to save memory
@@ -159,7 +173,8 @@ class StateManager:
             timestamp=time.time(),
             changed_since_last=changed,
             note=note,
-            phash=phash,
+            phash=phash or visual_hash,
+            visual_hash=visual_hash or phash,
             hash_distance=hash_distance,
         )
         self.observations.append(obs)
@@ -222,6 +237,22 @@ class StateManager:
         self.stuck_reasons.append(reason)
         self.history.append(f"stuck:{reason}")
 
+    def record_event(self, event_type: str, payload: Optional[Dict[str, Any]] = None) -> None:
+        event = {
+            "type": str(event_type or "event"),
+            "timestamp": time.time(),
+            "payload": dict(payload or {}),
+        }
+        self.event_log.append(event)
+
+    def record_grounding(self, grounding: "GroundingBundle") -> None:
+        self.last_grounding = grounding
+        self.record_event("grounding", grounding.to_compact_dict(include_image=False))
+
+    def record_turn(self, turn: "ReActTurn") -> None:
+        self.turns.append(turn)
+        self.record_event("react_turn", turn.to_dict())
+
     def record_verification_failure(self, reason: str, action: Optional[Dict[str, Any]] = None) -> None:
         """Record a post-action verification failure as a real failure signal."""
         self.failure_count += 1
@@ -238,6 +269,26 @@ class StateManager:
             "runtime_seconds": time.time() - self.started_at,
             "stuck_reasons": list(self.stuck_reasons),
         }
+
+    def compact_view(self) -> Dict[str, Any]:
+        last_action = self.actions[-1] if self.actions else None
+        last_turn = self.turns[-1].to_dict() if self.turns else None
+        grounding_quality = {}
+        if self.last_grounding:
+            grounding_quality = dict(self.last_grounding.quality)
+        return {
+            "steps": self.steps,
+            "failure_count": self.failure_count,
+            "stuck_reasons": list(self.stuck_reasons[-5:]),
+            "last_action": last_action,
+            "last_turn": last_turn,
+            "grounding_quality": grounding_quality,
+            "recent_events": list(self.event_log[-10:]),
+            "recent_history": list(self.history[-12:]),
+        }
+
+    def to_react_view(self) -> Dict[str, Any]:
+        return self.compact_view()
 
     def _summarize_browser_result(self, action: Dict[str, Any], result: ActionResult) -> str:
         """

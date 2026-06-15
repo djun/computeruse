@@ -8,7 +8,9 @@ from urllib.parse import urlparse
 from cua_agent.agent.state_manager import VERIFICATION_SENSOR_HIERARCHY
 from cua_agent.computer.adapter import ComputerAdapter
 from cua_agent.computer.types import COMPUTER_ACTION_SPACE
+from cua_agent.orchestrator.react_types import ActionEnvelope, GroundingBundle
 from cua_agent.utils.config import Settings
+from cua_agent.utils.image_mime import configured_image_mime, image_data_uri
 from cua_agent.utils.logger import get_logger
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -545,12 +547,47 @@ class CognitiveCore:
         relevant_skills: Optional[List[Any]] = None,
     ) -> Dict[str, Any]:
         """Return the next action as a dict with at least a `type` field."""
+        envelope = self.propose_react_action(
+            observation_b64,
+            history,
+            include_visual_context=include_visual_context,
+            user_prompt=user_prompt,
+            repeat_info=repeat_info,
+            plan=plan,
+            current_step=current_step,
+            loop_state=loop_state,
+            ax_tree=ax_tree,
+            som_tags=som_tags,
+            relevant_skills=relevant_skills,
+        )
+        return envelope.action
+
+    def propose_react_action(
+        self,
+        observation_b64: str,
+        history: List[str],
+        include_visual_context: bool = True,
+        user_prompt: Optional[str] = None,
+        repeat_info: Optional[Dict[str, Any]] = None,
+        plan: Optional["Plan"] = None,
+        current_step: Optional["Step"] = None,
+        loop_state: Optional[Dict[str, Any]] = None,
+        ax_tree: Optional[Dict[str, Any]] = None,
+        som_tags: Optional[List[Dict[str, Any]]] = None,
+        relevant_skills: Optional[List[Any]] = None,
+        grounding: Optional[GroundingBundle] = None,
+        state_view: Optional[Dict[str, Any]] = None,
+    ) -> ActionEnvelope:
+        """Return a structured operational envelope around the next action."""
         if not self.client:
             action_type = "noop" if history else "capture_only"
-            return {
-                "type": action_type,
-                "reason": "Cognitive core running without OpenRouter client.",
-            }
+            action = {"type": action_type, "reason": "Cognitive core running without OpenRouter client."}
+            return ActionEnvelope(
+                observation_summary=action["reason"],
+                state_assessment="model client unavailable",
+                action=action,
+                confidence=0.0,
+            )
 
         try:
             response = self._call_openrouter(
@@ -565,21 +602,25 @@ class CognitiveCore:
                 ax_tree=ax_tree,
                 som_tags=som_tags,
                 relevant_skills=relevant_skills,
+                grounding=grounding,
+                state_view=state_view,
             )
             parsed_action = self._parse_tool_call(response)
             if parsed_action:
                 model_text = self._extract_response_text(response)
-                return self._annotate_with_debug_trace(
+                action = self._annotate_with_debug_trace(
                     parsed_action,
                     model_text=model_text,
                     current_step=current_step,
                     loop_state=loop_state,
                     repeat_info=repeat_info,
                 )
+                return self._build_action_envelope(action, model_text=model_text)
         except Exception as exc:  # pragma: no cover - defensive fallback
             self.logger.exception("OpenRouter call failed; falling back to noop.", exc_info=exc)
 
-        return {"type": "noop", "reason": "Failed to generate action"}
+        action = {"type": "noop", "reason": "Failed to generate action"}
+        return ActionEnvelope(observation_summary=action["reason"], action=action, confidence=0.0)
 
     def _call_openrouter(
         self,
@@ -594,6 +635,8 @@ class CognitiveCore:
         ax_tree: Optional[Dict[str, Any]],
         som_tags: Optional[List[Dict[str, Any]]],
         relevant_skills: Optional[List[Any]],
+        grounding: Optional[GroundingBundle] = None,
+        state_view: Optional[Dict[str, Any]] = None,
     ) -> Any:
         """Send a vision + tool-calling request to OpenRouter."""
         windows_cyborg = self.platform_name.lower().startswith("windows") and self.settings.windows_cyborg_mode
@@ -667,7 +710,8 @@ class CognitiveCore:
             for tag in som_tags[:50]:
                 frame = tag.get("frame", {})
                 som_lines.append(
-                    f"#{tag.get('id')}: role={tag.get('role','')} label={tag.get('label','')} "
+                    f"#{tag.get('id')}: gid={tag.get('gid','')} source={tag.get('source','')} "
+                    f"confidence={tag.get('confidence', 0.0)} role={tag.get('role','')} label={tag.get('label','')} "
                     f"frame=({frame.get('x','?')},{frame.get('y','?')},{frame.get('w','?')},{frame.get('h','?')}) (logical pts)"
                 )
             som_context = (
@@ -675,6 +719,29 @@ class CognitiveCore:
                 "Use element_id to reference these instead of guessing coordinates.\n"
                 + "\n".join(som_lines)
             )
+
+        grounding_context = ""
+        if grounding:
+            candidate_lines = []
+            for node in grounding.prompt_nodes(limit=40):
+                frame = node.get("frame", {})
+                candidate_lines.append(
+                    f"- {node.get('gid')}: source={node.get('source')} role={node.get('role')} "
+                    f"label={node.get('label')} confidence={node.get('confidence')} "
+                    f"frame=({frame.get('x')},{frame.get('y')},{frame.get('w')},{frame.get('h')})"
+                )
+            grounding_context = (
+                "\nFused grounding candidates (semantic + visual):\n"
+                + ("\n".join(candidate_lines) if candidate_lines else "- none")
+                + f"\nGrounding quality: {grounding.quality}\n"
+            )
+
+        state_view_context = ""
+        if state_view:
+            try:
+                state_view_context = "\nTyped state view:\n" + json.dumps(state_view, ensure_ascii=False)[:3000]
+            except Exception:
+                state_view_context = ""
 
         tool_status = self._tool_enabled_map()
         allow_gui = bool(tool_status.get("computer", False))
@@ -755,11 +822,15 @@ class CognitiveCore:
             {skills_context}
             {ax_context}
             {som_context}
+            {grounding_context}
+            {state_view_context}
 
             Planning & Thinking
             {visual_context_line}
             - Always reason from what is currently visible: windows, icons, menus.
             - Use the provided Accessibility Tree and numbered overlay marks to ground actions. If a tag exists, return its ID via `element_id` instead of guessing coordinates.
+            - Prefer fused candidates when available. Use semantic/fused targets for accessible controls and visual targets for controls missing from AX/UIA.
+            - Keep any non-tool text to a short operational summary; do not expose long reasoning.
             - Use `inspect_ui` if visual elements are ambiguous or you need to find hidden controls.
             - Coordinates: only provide x/y when no overlay tag is available. If using x/y, return logical display points (screenshot is already downscaled to logical resolution).
             - To reduce latency, prefer batching obvious sequences (e.g., click + type + enter) using `actions`.
@@ -793,7 +864,7 @@ class CognitiveCore:
         if repeat_info and repeat_info.get("hint"):
             system_prompt += f" Hint from verifier: {repeat_info['hint']}."
 
-        mime = "image/png" if self.settings.encode_format.lower() == "png" else "image/jpeg"
+        fallback_mime = configured_image_mime(self.settings.encode_format)
 
         task_hint = f"User request: {user_prompt}" if user_prompt else "No explicit user task provided."
         prompt_suffix = (
@@ -810,7 +881,7 @@ class CognitiveCore:
             content.append(
                 {
                     "type": "image_url",
-                    "image_url": {"url": f"data:{mime};base64,{observation_b64}"},
+                    "image_url": {"url": image_data_uri(observation_b64, fallback=fallback_mime)},
                 }
             )
 
@@ -1511,6 +1582,51 @@ class CognitiveCore:
                         chunks.append(str(text))
             return "\n".join(chunks).strip()
         return str(content).strip()
+
+    def _build_action_envelope(self, action: Dict[str, Any], *, model_text: str = "") -> ActionEnvelope:
+        data = self._parse_envelope_text(model_text)
+        verification = action.get("verification") if isinstance(action.get("verification"), dict) else None
+        target: Dict[str, Any] = {}
+        for key in ("target_gid", "element_id", "element_ref", "semantic_label", "semantic_role"):
+            if action.get(key) is not None:
+                target[key] = action.get(key)
+        if isinstance(data.get("target"), dict):
+            target.update(data.get("target") or {})
+
+        try:
+            confidence = float(data.get("confidence", 0.0))
+        except (TypeError, ValueError):
+            confidence = 0.0
+
+        fallback = data.get("fallback_if_failed")
+        if not isinstance(fallback, list):
+            fallback = []
+
+        return ActionEnvelope(
+            observation_summary=str(data.get("observation_summary") or model_text or "")[:800],
+            state_assessment=str(data.get("state_assessment") or "")[:800],
+            target=target,
+            action=action,
+            verification=data.get("verification") if isinstance(data.get("verification"), dict) else verification,
+            fallback_if_failed=[str(item) for item in fallback[:5]],
+            confidence=confidence,
+            needs_fresh_grounding=bool(data.get("needs_fresh_grounding", False)),
+            raw_response_text=model_text[:2000],
+        )
+
+    def _parse_envelope_text(self, model_text: str) -> Dict[str, Any]:
+        raw = str(model_text or "").strip()
+        if not raw:
+            return {}
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            return {"observation_summary": raw[:800]}
+        try:
+            parsed = json.loads(raw[start : end + 1])
+        except Exception:
+            return {"observation_summary": raw[:800]}
+        return parsed if isinstance(parsed, dict) else {}
 
     def _annotate_with_debug_trace(
         self,

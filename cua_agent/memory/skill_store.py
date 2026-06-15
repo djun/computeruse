@@ -10,9 +10,20 @@ from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-def _fingerprint_actions(actions: List[Dict[str, Any]]) -> str:
-    """Stable hash of a macro action list for deduplication."""
-    canonical = json.dumps(actions, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+def _fingerprint_actions(
+    actions: List[Dict[str, Any]],
+    semantic_hints: Optional[Dict[str, Any]] = None,
+    verification_contract: Optional[Dict[str, Any]] = None,
+    preconditions: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Stable contextual hash of a macro for deduplication."""
+    payload = {
+        "actions": actions,
+        "semantic_hints": semantic_hints or {},
+        "verification_contract": verification_contract or {},
+        "preconditions": preconditions or {},
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha1(canonical.encode("utf-8")).hexdigest()
 
 
@@ -34,6 +45,12 @@ class ProceduralSkill:
     semantic_hints: Dict[str, Any] = field(default_factory=dict)
     parameters: Dict[str, Any] = field(default_factory=dict)
     verification_contract: Dict[str, Any] = field(default_factory=dict)
+    preconditions: Dict[str, Any] = field(default_factory=dict)
+    postconditions: Dict[str, Any] = field(default_factory=dict)
+    negative_examples: List[Dict[str, Any]] = field(default_factory=list)
+    grounding_signature: Dict[str, Any] = field(default_factory=dict)
+    failure_count: int = 0
+    success_count: int = 0
 
     @classmethod
     def from_dict(cls, raw: Dict[str, Any]) -> "ProceduralSkill":
@@ -46,6 +63,18 @@ class ProceduralSkill:
         verification_contract = raw.get("verification_contract", {}) or raw.get("verification", {}) or {}
         if not isinstance(verification_contract, dict):
             verification_contract = {}
+        preconditions = raw.get("preconditions", {}) or {}
+        if not isinstance(preconditions, dict):
+            preconditions = {}
+        postconditions = raw.get("postconditions", {}) or {}
+        if not isinstance(postconditions, dict):
+            postconditions = {}
+        grounding_signature = raw.get("grounding_signature", {}) or {}
+        if not isinstance(grounding_signature, dict):
+            grounding_signature = {}
+        negative_examples = raw.get("negative_examples", []) or []
+        if not isinstance(negative_examples, list):
+            negative_examples = []
 
         return cls(
             id=raw.get("id", str(uuid.uuid4())),
@@ -64,6 +93,12 @@ class ProceduralSkill:
             semantic_hints=raw.get("semantic_hints", {}) or {},
             parameters=parameters,
             verification_contract=verification_contract,
+            preconditions=preconditions,
+            postconditions=postconditions,
+            negative_examples=[item for item in negative_examples if isinstance(item, dict)],
+            grounding_signature=grounding_signature,
+            failure_count=int(raw.get("failure_count", 0) or 0),
+            success_count=int(raw.get("success_count", 0) or 0),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -93,6 +128,10 @@ class SkillStore:
         semantic_hints: Optional[Dict[str, Any]] = None,
         parameters: Optional[Dict[str, Any]] = None,
         verification_contract: Optional[Dict[str, Any]] = None,
+        preconditions: Optional[Dict[str, Any]] = None,
+        postconditions: Optional[Dict[str, Any]] = None,
+        negative_examples: Optional[List[Dict[str, Any]]] = None,
+        grounding_signature: Optional[Dict[str, Any]] = None,
     ) -> ProceduralSkill:
         """Persist a skill; deduplicate by action fingerprint."""
         cleaned_actions = [dict(a) for a in (actions or []) if isinstance(a, dict)]
@@ -102,8 +141,21 @@ class SkillStore:
         cleaned_verification = (
             dict(verification_contract) if isinstance(verification_contract, dict) else {}
         )
+        cleaned_preconditions = dict(preconditions) if isinstance(preconditions, dict) else {}
+        cleaned_postconditions = dict(postconditions) if isinstance(postconditions, dict) else {}
+        cleaned_grounding_signature = (
+            dict(grounding_signature) if isinstance(grounding_signature, dict) else {}
+        )
+        cleaned_negative_examples = [
+            dict(item) for item in (negative_examples or []) if isinstance(item, dict)
+        ]
 
-        fingerprint = _fingerprint_actions(cleaned_actions)
+        fingerprint = _fingerprint_actions(
+            cleaned_actions,
+            semantic_hints=semantic_hints or {},
+            verification_contract=cleaned_verification,
+            preconditions=cleaned_preconditions,
+        )
         existing = self._find_by_fingerprint(fingerprint)
         now = time.time()
         if existing:
@@ -122,6 +174,14 @@ class SkillStore:
                 existing.parameters = cleaned_parameters
             if cleaned_verification:
                 existing.verification_contract = cleaned_verification
+            if cleaned_preconditions:
+                existing.preconditions = cleaned_preconditions
+            if cleaned_postconditions:
+                existing.postconditions = cleaned_postconditions
+            if cleaned_grounding_signature:
+                existing.grounding_signature = cleaned_grounding_signature
+            if cleaned_negative_examples:
+                existing.negative_examples.extend(cleaned_negative_examples)
             self._write(existing)
             return existing
 
@@ -141,6 +201,10 @@ class SkillStore:
             semantic_hints=semantic_hints or {},
             parameters=cleaned_parameters,
             verification_contract=cleaned_verification,
+            preconditions=cleaned_preconditions,
+            postconditions=cleaned_postconditions,
+            negative_examples=cleaned_negative_examples,
+            grounding_signature=cleaned_grounding_signature,
         )
         self._write(skill)
         return skill
@@ -174,6 +238,27 @@ class SkillStore:
         skill.usage_count += 1
         skill.last_used = time.time()
         skill.updated_at = skill.last_used
+        self._write(skill)
+        return skill
+
+    def record_result(
+        self,
+        skill_id: str,
+        *,
+        success: bool,
+        negative_example: Optional[Dict[str, Any]] = None,
+    ) -> Optional[ProceduralSkill]:
+        skill = self.get_skill(skill_id)
+        if not skill:
+            return None
+        if success:
+            skill.success_count += 1
+        else:
+            skill.failure_count += 1
+            if negative_example:
+                skill.negative_examples.append(dict(negative_example))
+                skill.negative_examples = skill.negative_examples[-20:]
+        skill.updated_at = time.time()
         self._write(skill)
         return skill
 

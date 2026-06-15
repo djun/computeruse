@@ -4,7 +4,28 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
-INTERACTIVE_ROLES = {"AXButton", "AXTextField", "AXTextArea", "AXLink", "AXCheckBox", "AXComboBox", "AXMenuItem"}
+INTERACTIVE_ROLES = {
+    "AXButton",
+    "AXTextField",
+    "AXTextArea",
+    "AXLink",
+    "AXCheckBox",
+    "AXComboBox",
+    "AXMenuItem",
+    "Button",
+    "ControlType.Button",
+    "Edit",
+    "ControlType.Edit",
+    "TextBox",
+    "Hyperlink",
+    "ControlType.Hyperlink",
+    "CheckBox",
+    "ControlType.CheckBox",
+    "ComboBox",
+    "ControlType.ComboBox",
+    "MenuItem",
+    "ControlType.MenuItem",
+}
 
 
 def prune_ax_tree_for_prompt(tree: Dict[str, Any], max_nodes: int = 120, max_depth: int = 4) -> Dict[str, Any]:

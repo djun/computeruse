@@ -58,9 +58,12 @@ class ActionEngine:
         if not decision.allowed:
             self.logger.warning("Action blocked by policy: %s", decision.reason)
             return ActionResult(success=False, reason=decision.reason)
-        if decision.hitl_required:
+        hitl_reason = (decision.reason or "policy hitl") if decision.hitl_required else ""
+        if not hitl_reason and action.get("requires_hitl_confirmation"):
+            hitl_reason = str(action.get("hitl_reason") or "autonomy policy confirmation")
+        if hitl_reason:
             self.logger.warning("Action requires human confirmation: %s", action)
-            approved, deny_reason = self._request_hitl_approval(action, decision.reason or "policy hitl")
+            approved, deny_reason = self._request_hitl_approval(action, hitl_reason)
             if not approved:
                 return ActionResult(success=False, reason=deny_reason)
 
@@ -493,6 +496,34 @@ class ActionEngine:
                 reason = "accessibility tree missing"
         else:
             reason = ax_res.reason or "accessibility tree unavailable"
+
+        if self.vision_pipeline:
+            try:
+                frame = self.vision_pipeline.capture_base64()
+                visual_nodes = self.vision_pipeline.detect_ui_elements(frame)
+                best = self._pick_visual_node(
+                    visual_nodes,
+                    hint_role,
+                    hint_label or element_ref,
+                    hint_path,
+                    anchor_x,
+                    anchor_y,
+                    allow_anchor_only=allow_coordinate_fallback,
+                )
+                if best:
+                    frame_data = best.get("frame") or {}
+                    cx = float(frame_data.get("x", 0)) + float(frame_data.get("w", 0)) / 2.0
+                    cy = float(frame_data.get("y", 0)) + float(frame_data.get("h", 0)) / 2.0
+                    return {
+                        "x": cx,
+                        "y": cy,
+                        "semantic_role": best.get("role", ""),
+                        "semantic_label": best.get("label", best.get("title", "")),
+                        "semantic_path": best.get("path", ""),
+                        "grounding_source": best.get("source", "vision"),
+                    }, "resolved via visual fallback"
+            except Exception as exc:
+                self.logger.debug("visual target resolution failed: %s", exc)
 
         if allow_coordinate_fallback and anchor_x is not None and anchor_y is not None:
             return {

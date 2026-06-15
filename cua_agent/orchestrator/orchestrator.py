@@ -12,11 +12,17 @@ from typing import Any, Dict, List, Optional
 from cua_agent.agent.cognitive_core import CognitiveCore
 from cua_agent.agent.state_manager import ActionResult, StateManager, VerificationContract
 from cua_agent.computer.adapter import ComputerAdapter
+from cua_agent.grounding.grounder import Grounder
 from cua_agent.memory.memory_manager import Episode, MemoryManager
 from cua_agent.observability import LiveDebugDashboard
+from cua_agent.orchestrator.action_policy import ActionPolicy
+from cua_agent.orchestrator.learning_manager import LearningManager
 from cua_agent.orchestrator.planner_client import PlannerClient
 from cua_agent.orchestrator.planning import Plan, Step
+from cua_agent.orchestrator.react_controller import ReactController
+from cua_agent.orchestrator.recovery_manager import RecoveryManager
 from cua_agent.orchestrator.reflection import Reflector
+from cua_agent.orchestrator.verification_manager import VerificationManager
 from cua_agent.utils.config import Settings
 from cua_agent.utils.logger import get_logger
 from cua_agent.utils.ax_pruning import prune_ax_tree_for_prompt
@@ -34,8 +40,14 @@ class Orchestrator:
         self.logger = get_logger(__name__, level=settings.log_level)
         self.cognitive_core = CognitiveCore(settings, computer)
         self.memory = MemoryManager(settings)
-        self.planner = PlannerClient(settings)
+        self.planner = PlannerClient(settings, platform_name=computer.platform_name)
         self.reflector = Reflector(settings)
+        self.grounder = Grounder(settings, computer)
+        self.verifier = VerificationManager(settings, computer)
+        self.action_policy = ActionPolicy(settings)
+        self.react_controller = ReactController(settings)
+        self.recovery_manager = RecoveryManager(settings)
+        self.learning_manager = LearningManager()
         self.dashboard = LiveDebugDashboard(settings, self.logger)
         self.display = computer.display
         self.global_hotkeys = getattr(computer, "global_hotkeys", set())
@@ -116,15 +128,16 @@ class Orchestrator:
         hint_count = 0
         max_hints = 3
         plan_revision_count = 0
-        max_plan_revisions = 3
+        max_plan_revisions = self.settings.max_replans_per_task
         global_hotkeys = self.global_hotkeys
         low_change_streak = 0
-        PHASH_STATIC_THRESHOLD = 4  # Hamming distance; increased to ignore noise
+        VISUAL_HASH_STATIC_THRESHOLD = 4  # Hamming distance; increased to ignore noise
         STAGNATION_LIMIT = 5        # consecutive frames with minimal change
         current_tags: List[Dict[str, Any]] = []
         step_trace: List[Dict[str, Any]] = []
         active_step_id = plan.current_step().id if plan and plan.current_step() else None
         force_vision_next_turn = True
+        low_conf_refresh_streak = 0
 
         try:
             while not state.should_halt():
@@ -153,41 +166,26 @@ class Orchestrator:
                 if current_step_id != active_step_id:
                     step_trace = []
                     active_step_id = current_step_id
+                turn = self.react_controller.start_turn(state, plan)
                 include_visual_context = force_vision_next_turn
                 
                 # Context Compression
                 if len(state.history) > 60:
                     self._compress_history(state)
 
-                # Semantic Grounding: Fetch accessibility tree
-                ax_tree = None
-                if self.settings.enable_semantic:
-                    ax_res = self.computer.get_active_window_tree(max_depth=4)
-                    if ax_res.success:
-                        raw_tree = ax_res.metadata.get("tree")
-                        ax_tree = prune_ax_tree_for_prompt(raw_tree) if raw_tree else None
-                        # self.logger.debug("Fetched AX tree for grounding")
-
-                # Visual Fallback if AX failed or is empty
-                if not ax_tree:
-                    vision_elements = self.computer.detect_ui_elements(current_frame)
-                    if vision_elements:
-                        self.logger.info("Using visual grounding fallback, found %d elements", len(vision_elements))
-                        ax_tree = {
-                            "role": "AXWindow",
-                            "title": "Visual Fallback",
-                            "children": vision_elements,
-                            "frame": {"x": 0, "y": 0, "w": self.display.logical_width, "h": self.display.logical_height}
-                        }
-
-                # Overlay Set-of-Mark tags onto the screenshot for grounding
-                overlay_frame = current_frame
-                current_tags = []
-                if ax_tree and include_visual_context:
-                    nodes = flatten_nodes_with_frames(ax_tree, max_nodes=40)
-                    overlay_frame, current_tags = draw_som_overlay(current_frame, nodes, self.display)
-                elif not include_visual_context:
-                    overlay_frame = ""
+                force_grounding_vision = force_vision_next_turn or self.react_controller.should_force_vision(state)
+                grounding = self.grounder.observe(
+                    previous=state.last_grounding,
+                    force_vision=force_grounding_vision,
+                    include_semantic=self.settings.enable_semantic,
+                    include_visual=True,
+                )
+                state.record_grounding(grounding)
+                current_frame = grounding.screenshot_b64
+                current_hash = grounding.frame_hash
+                ax_tree = grounding.ax_tree
+                current_tags = grounding.som_tags
+                overlay_frame = grounding.overlay_b64 if include_visual_context else ""
 
                 loop_state = self._format_loop_state(plan, state, repeat_same_action, repeat_without_change)
                 loop_state["visual_context"] = "image" if include_visual_context else "text_only"
@@ -198,7 +196,7 @@ class Orchestrator:
                 if query_text:
                     relevant_skills = self.memory.search_skills(query_text)
 
-                action = self.cognitive_core.propose_action(
+                envelope = self.cognitive_core.propose_react_action(
                     overlay_frame,
                     state.history,
                     include_visual_context=include_visual_context,
@@ -210,7 +208,10 @@ class Orchestrator:
                     ax_tree=ax_tree,
                     som_tags=current_tags,
                     relevant_skills=relevant_skills,
+                    grounding=grounding,
+                    state_view=state.to_react_view(),
                 )
+                action = envelope.action
                 cognitive_trace = self._extract_cognitive_trace(action)
                 if cognitive_trace:
                     self.dashboard.push_thought(cognitive_trace)
@@ -266,9 +267,61 @@ class Orchestrator:
                     elif skill_contract:
                         action["verification"] = skill_contract
                 action = self._strip_debug_fields(action)
-                verification_contract = self._resolve_verification_contract(state, action, current_step)
+                policy_decision = self.action_policy.normalize_and_guard(
+                    action,
+                    grounding=grounding,
+                    state=state,
+                    step_risk=getattr(current_step, "risk_level", None) if current_step else None,
+                )
+                action = policy_decision.action
+                if not policy_decision.allowed:
+                    result = self.action_policy.blocked_result(policy_decision)
+                    state.record_action(action, result)
+                    repeat_info_for_model = {
+                        "count": repeat_same_action,
+                        "action": repr(action),
+                        "hint": policy_decision.reason,
+                    }
+                    self.learning_manager.record_turn(
+                        state,
+                        self.react_controller.finalize_turn(
+                            turn,
+                            observation_summary=envelope.observation_summary,
+                            grounding_quality=grounding.quality,
+                            selected_target_gid=policy_decision.target_gid,
+                            action=action,
+                            result={"success": result.success, "reason": result.reason, "metadata": result.metadata},
+                            recovery_decision={"reason": policy_decision.reason, "stop": False},
+                        ),
+                    )
+                    continue
+
+                # Honor the policy's low-confidence target signal: refresh grounding
+                # before acting so MIN_GROUNDING_CONFIDENCE is enforced rather than
+                # advisory. Bounded to one refresh per weak target so a persistently
+                # weak target still gets a best-effort attempt instead of looping.
+                if bool(action.pop("needs_fresh_grounding", False)) and low_conf_refresh_streak < 1:
+                    low_conf_refresh_streak += 1
+                    state.history.append("grounding_confidence_low:refresh_before_act")
+                    self.dashboard.push_event(
+                        "grounding confidence below MIN_GROUNDING_CONFIDENCE; refreshing before acting"
+                    )
+                    repeat_info_for_model = {
+                        "count": repeat_same_action,
+                        "action": repr(action),
+                        "hint": (
+                            "Target grounding confidence below MIN_GROUNDING_CONFIDENCE; grounding was "
+                            "refreshed. Re-select the target on the new overlay or pick a higher-confidence element."
+                        ),
+                    }
+                    current_frame, current_hash, current_tags, ax_tree = self._refresh_grounding(state)
+                    force_vision_next_turn = True
+                    continue
+                low_conf_refresh_streak = 0
+
+                verification_contract = self.verifier.resolve_contract(state, action, current_step)
                 action["verification"] = verification_contract.to_dict()
-                telemetry_before = self._collect_os_telemetry_snapshot(verification_contract)
+                telemetry_before = self.verifier.collect_os_telemetry_snapshot(verification_contract)
 
                 # Resolve overlay element references to coordinates
                 resolved_ok = self._resolve_element_references(action, current_tags)
@@ -343,7 +396,7 @@ class Orchestrator:
                     if stderr:
                         state.history.append(f"shell_stderr:{stderr[:500]}")
 
-                verification_outcome = self._run_verification_contract(
+                verification_outcome = self.verifier.run_verification_contract(
                     action=action,
                     contract=verification_contract,
                     current_frame=current_frame,
@@ -351,7 +404,7 @@ class Orchestrator:
                     ax_tree_before=ax_tree,
                     telemetry_before=telemetry_before,
                     global_hotkeys=global_hotkeys,
-                    phash_static_threshold=PHASH_STATIC_THRESHOLD,
+                    visual_hash_static_threshold=VISUAL_HASH_STATIC_THRESHOLD,
                 )
 
                 next_frame = verification_outcome["next_frame"]
@@ -377,6 +430,38 @@ class Orchestrator:
                     ssim_score=ssim_score,
                     ax_changed=ax_changed,
                     note=obs_note,
+                )
+
+                recovery_decision = self.recovery_manager.decide(
+                    state=state,
+                    plan=plan,
+                    verification=verification_outcome,
+                    repeat_same_action=repeat_same_action,
+                    repeat_without_change=repeat_without_change,
+                    reason=verification_reason,
+                )
+                # Strip heavy payloads (base64 frame, full a11y subtree) from the
+                # turn record. The turn is copied into the event log and fed back
+                # through compact_view into the next prompt; keeping image/tree data
+                # there bloats memory and displaces useful state when the prompt is
+                # truncated. The full outcome is still used directly above/below.
+                verification_record = {
+                    key: value
+                    for key, value in verification_outcome.items()
+                    if key not in {"next_frame", "ax_tree_after"}
+                }
+                self.learning_manager.record_turn(
+                    state,
+                    self.react_controller.finalize_turn(
+                        turn,
+                        observation_summary=envelope.observation_summary,
+                        grounding_quality=grounding.quality,
+                        selected_target_gid=action.get("target_gid") or policy_decision.target_gid,
+                        action=action,
+                        verification=verification_record,
+                        result={"success": result.success, "reason": result.reason, "metadata": result.metadata},
+                        recovery_decision=recovery_decision.to_dict(),
+                    ),
                 )
 
                 if not verification_passed:
@@ -464,7 +549,7 @@ class Orchestrator:
                     self.logger.warning("Critical no-change detected: %s", no_change_reason)
 
                 if contract_requires_check:
-                    if hash_distance <= PHASH_STATIC_THRESHOLD and is_action_interactive and not ax_changed:
+                    if hash_distance <= VISUAL_HASH_STATIC_THRESHOLD and is_action_interactive and not ax_changed:
                         low_change_streak += 1
                     else:
                         low_change_streak = 0
@@ -686,12 +771,54 @@ class Orchestrator:
             return True
         return False
 
+    def _current_skill_context(self) -> Dict[str, Any]:
+        context: Dict[str, Any] = {"platform": self.computer.platform_name}
+        try:
+            ax_res = self.computer.get_active_window_tree(max_depth=1)
+            if ax_res.success:
+                tree = (ax_res.metadata or {}).get("tree") or {}
+                title = str(tree.get("title") or tree.get("name") or "").strip()
+                if title:
+                    context["active_window_title"] = title
+                app = str(tree.get("app") or tree.get("application") or "").strip()
+                if app:
+                    context["active_app"] = app
+        except Exception:
+            pass
+        return context
+
+    def _grounding_signature_from_frame(self, frame_b64: str) -> Dict[str, Any]:
+        signature: Dict[str, Any] = {"labels": [], "roles": []}
+        try:
+            nodes = self.computer.detect_ui_elements(frame_b64)
+        except Exception:
+            return signature
+        labels: set[str] = set()
+        roles: set[str] = set()
+        for node in nodes or []:
+            label = str(node.get("label") or node.get("title") or node.get("text") or "").strip()
+            role = str(node.get("role") or "").strip()
+            if label:
+                labels.add(label[:120])
+            if role:
+                roles.add(role[:80])
+        signature["labels"] = sorted(labels)[:40]
+        signature["roles"] = sorted(roles)[:40]
+        return signature
+
     def _attempt_fast_path(self, user_prompt: str, current_frame: str, current_hash: str) -> dict:
         """
         Try a high-confidence procedural skill before invoking planner/model.
         Falls back to normal planning when the cached macro does not complete the task.
         """
-        match = self.memory.select_fast_path_skill(user_prompt, top_k=3)
+        context = self._current_skill_context()
+        grounding_signature = self._grounding_signature_from_frame(current_frame)
+        match = self.memory.select_fast_path_skill(
+            user_prompt,
+            top_k=3,
+            context=context,
+            grounding_signature=grounding_signature,
+        )
         if not match:
             return {"attempted": False, "success": False}
 
@@ -772,6 +899,7 @@ class Orchestrator:
                 skill_id=skill.id,
                 skill_name=skill.name,
             )
+            self.memory.record_skill_result(skill.id, success=True)
             self.logger.info("Fast-path succeeded with skill %s", skill.id)
             return {
                 "attempted": True,
@@ -794,6 +922,16 @@ class Orchestrator:
             )
         except Exception as exc:  # pragma: no cover - defensive
             self.logger.debug("Failed to persist fast-path failure memory: %s", exc)
+        self.memory.record_skill_result(
+            skill.id,
+            success=False,
+            negative_example={
+                "prompt": user_prompt,
+                "reason": failure_note,
+                "context": context,
+                "grounding_signature": grounding_signature,
+            },
+        )
         self.logger.info("Fast-path failed for skill %s, falling back to planner", skill.id)
         return {
             "attempted": True,
@@ -895,6 +1033,7 @@ class Orchestrator:
             if current_step and current_step.id:
                 tags.append(f"step:{current_step.id}")
             verification_contract = self._derive_skill_verification_contract(current_step)
+            preconditions, grounding_signature = self._skill_context_metadata(actions)
             self.memory.save_skill(
                 name=name,
                 description=description,
@@ -904,6 +1043,8 @@ class Orchestrator:
                 plan_step_id=current_step.id if current_step else None,
                 parameters=parameters,
                 verification_contract=verification_contract,
+                preconditions=preconditions,
+                grounding_signature=grounding_signature,
             )
             self.logger.info(
                 "Synthesized procedural skill '%s' with %d actions (had_failures=%s)",
@@ -1735,6 +1876,8 @@ class Orchestrator:
                 if not self._has_non_clipboard_os_delta(before_snapshot, after_snapshot):
                     return False, "os telemetry inconclusive (clipboard-only change)"
                 return True, "os telemetry changed"
+            if key in {"state_change", "changed"}:
+                return False, "os telemetry unchanged"
             if not self._has_non_clipboard_os_signal(before_snapshot, after_snapshot):
                 return False, "os telemetry inconclusive (no non-clipboard signal)"
             return False, "os telemetry unchanged"
@@ -2097,6 +2240,7 @@ class Orchestrator:
             raw_actions = [dict(a) for a in action.get("actions") or []]
             composable_actions, parameters = self._build_composable_skill_payload(raw_actions)
             verification_contract = self._derive_skill_verification_contract(current_step, source_action=action)
+            preconditions, grounding_signature = self._skill_context_metadata(composable_actions)
             self.memory.save_skill(
                 name=name,
                 description=description,
@@ -2106,9 +2250,36 @@ class Orchestrator:
                 plan_step_id=current_step.id if current_step else None,
                 parameters=parameters,
                 verification_contract=verification_contract,
+                preconditions=preconditions,
+                grounding_signature=grounding_signature,
             )
         except Exception as exc:  # pragma: no cover - defensive
             self.logger.warning("Failed to save procedural skill: %s", exc)
+
+    def _skill_context_metadata(self, actions: List[Dict[str, Any]]) -> tuple[Dict[str, Any], Dict[str, Any]]:
+        labels: set[str] = set()
+        roles: set[str] = set()
+        paths: set[str] = set()
+        for act in actions or []:
+            for key in ("semantic_label", "label"):
+                value = str(act.get(key) or "").strip()
+                if value and "{" not in value:
+                    labels.add(value[:120])
+            for key in ("semantic_role", "role"):
+                value = str(act.get(key) or "").strip()
+                if value:
+                    roles.add(value[:80])
+            value = str(act.get("semantic_path") or act.get("path") or "").strip()
+            if value and "{" not in value:
+                paths.add(value[:180])
+        computer = getattr(self, "computer", None)
+        preconditions = {"platform": getattr(computer, "platform_name", "unknown")}
+        grounding_signature = {
+            "labels": sorted(labels),
+            "roles": sorted(roles),
+            "paths": sorted(paths),
+        }
+        return preconditions, grounding_signature
 
     def _slugify(self, text: str) -> str:
         """Lightweight slug for skill names."""
@@ -2167,8 +2338,15 @@ class Orchestrator:
             state.history = new_history
 
     def _resolve_element_references(self, action: dict, tags: List[Dict[str, Any]]) -> bool:
-        """Translate element_id to x/y (physical px) using the most recent overlay tags."""
-        lookup: Dict[str, Dict[str, Any]] = {str(tag["id"]): tag for tag in tags}
+        """Translate element_id/target_gid to x/y (physical px) using the most recent overlay tags."""
+        lookup: Dict[str, Dict[str, Any]] = {}
+        gid_lookup: Dict[str, Dict[str, Any]] = {}
+        for tag in tags:
+            if tag.get("id") is not None:
+                lookup[str(tag["id"])] = tag
+            gid = tag.get("gid")
+            if gid:
+                gid_lookup[str(gid)] = tag
 
         def _annotate_from_tag(act: dict, tag: Dict[str, Any]) -> bool:
             frame = tag.get("frame") or {}
@@ -2182,6 +2360,13 @@ class Orchestrator:
                     act["semantic_label"] = tag.get("label")
                 if "semantic_path" not in act and tag.get("path"):
                     act["semantic_path"] = tag.get("path")
+                if tag.get("gid"):
+                    act["target_gid"] = tag.get("gid")
+                if tag.get("source"):
+                    act["grounding_source"] = tag.get("source")
+                if tag.get("confidence") is not None:
+                    act["grounding_confidence"] = tag.get("confidence")
+                act["target_frame"] = dict(frame)
                 return True
             except Exception:
                 return False
@@ -2190,12 +2375,20 @@ class Orchestrator:
             if act.get("x") is not None and act.get("y") is not None:
                 return True
 
+            # The action policy may attach a fused-grounding target_gid; resolve it
+            # directly to coordinates before falling back to numeric/semantic refs.
+            target_gid = str(act.get("target_gid") or "").strip()
+            if target_gid:
+                tag = gid_lookup.get(target_gid)
+                if tag:
+                    return _annotate_from_tag(act, tag)
+
             raw_element_id = act.get("element_id")
             if raw_element_id is not None:
                 token = str(raw_element_id).strip()
                 if not token:
                     return True
-                tag = lookup.get(token)
+                tag = lookup.get(token) or gid_lookup.get(token)
                 if tag:
                     return _annotate_from_tag(act, tag)
                 if token.isdigit():
@@ -2217,6 +2410,9 @@ class Orchestrator:
                 if tag:
                     return _annotate_from_tag(act, tag)
                 return False
+            tag = gid_lookup.get(ref)
+            if tag:
+                return _annotate_from_tag(act, tag)
             matched = self._match_tag_reference(ref, tags)
             if matched:
                 return _annotate_from_tag(act, matched)
@@ -2313,6 +2509,22 @@ class Orchestrator:
         Capture a new frame, hash, tags, and AX tree immediately.
         Used when element references fail so the next action proposal has fresh context.
         """
+        if hasattr(self, "grounder"):
+            grounding = self.grounder.observe(
+                previous=state.last_grounding,
+                force_vision=True,
+                include_semantic=self.settings.enable_semantic,
+                include_visual=True,
+            )
+            state.record_grounding(grounding)
+            state.record_observation(
+                grounding.overlay_b64 or grounding.screenshot_b64,
+                changed=True,
+                phash=grounding.frame_hash,
+                note="grounding_refresh",
+            )
+            return grounding.screenshot_b64, grounding.frame_hash, grounding.som_tags, grounding.ax_tree
+
         frame, phash = self.computer.capture_with_hash()
         ax_tree = None
         if self.settings.enable_semantic:

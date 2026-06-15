@@ -96,7 +96,7 @@ class VisionPipeline(BaseVisionPipeline):
         return base64.b64encode(buffer.getvalue()).decode("ascii")
 
     def hash_base64(self, image_b64: str) -> str:
-        """Compute an average-hash from a base64-encoded image."""
+        """Compute a lightweight visual hash (average hash) from a base64 image."""
         image = self._decode(image_b64)
         return self._average_hash(image)
 
@@ -471,7 +471,7 @@ class VisionPipeline(BaseVisionPipeline):
         return Image.open(io.BytesIO(raw)).convert("RGB")
 
     def _average_hash(self, image: Image.Image, hash_size: int = 8) -> str:
-        """Lightweight perceptual hash (aHash) to detect subtle stagnation/loops."""
+        """Lightweight visual hash (aHash) to detect subtle stagnation/loops."""
         gray = image.convert("L")
         resample = getattr(Image, "Resampling", None)
         resample_filter = resample.LANCZOS if resample else Image.LANCZOS

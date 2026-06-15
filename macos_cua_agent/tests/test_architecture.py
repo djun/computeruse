@@ -115,7 +115,8 @@ class TestArchitecture(unittest.TestCase):
             "id": "plan_abc",
             "user_prompt": "sample task",
             "steps": [
-                {"id": 0, "description": "Step 0", "success_criteria": "Done", "status": "pending"}
+                {"id": 0, "description": "Step 0", "success_criteria": "Done", "status": "pending"},
+                {"id": 1, "description": "Step 1", "success_criteria": "Done", "status": "pending"},
             ],
             "current_step_index": 1,
         }

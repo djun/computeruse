@@ -122,10 +122,13 @@ def draw_som_overlay(
         manifest.append(
             {
                 "id": node["id"],
+                "gid": node.get("gid", ""),
                 "role": node.get("role", ""),
                 "label": node.get("label", ""),
                 "path": node.get("path", ""),
                 "frame": frame,
+                "source": node.get("source", ""),
+                "confidence": node.get("confidence", 0.0),
             }
         )
 

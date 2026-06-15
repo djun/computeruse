@@ -7,6 +7,7 @@ from typing import List, Optional
 
 from cua_agent.orchestrator.planning import Step
 from cua_agent.utils.config import Settings
+from cua_agent.utils.image_mime import configured_image_mime, image_data_uri
 from cua_agent.utils.logger import get_logger
 
 
@@ -25,7 +26,7 @@ class Reflector:
         self.settings = settings
         self.logger = get_logger(__name__, level=settings.log_level)
         self.client = self._build_client()
-        self.mime = "image/png" if settings.encode_format.lower() == "png" else "image/jpeg"
+        self.mime = configured_image_mime(settings.encode_format)
 
     def _build_client(self) -> Optional[object]:
         if not self.settings.enable_reflection:
@@ -63,7 +64,7 @@ class Reflector:
 
         content = [
             {"type": "text", "text": f"{prompt}\n\nRecent events:\n" + "\n".join(history[-20:])},
-            {"type": "image_url", "image_url": {"url": f"data:{self.mime};base64,{screenshot_b64}"}},
+            {"type": "image_url", "image_url": {"url": image_data_uri(screenshot_b64, fallback=self.mime)}},
         ]
 
         try:
@@ -139,7 +140,7 @@ class Reflector:
         )
         content = [
             {"type": "text", "text": f"{prompt}\n{step_text}\nRecent events:\n" + "\n".join(history[-30:])},
-            {"type": "image_url", "image_url": {"url": f"data:{self.mime};base64,{screenshot_b64}"}},
+            {"type": "image_url", "image_url": {"url": image_data_uri(screenshot_b64, fallback=self.mime)}},
         ]
         try:
             response = self.client.chat.completions.create(
@@ -168,7 +169,7 @@ class Reflector:
         )
         content = [
             {"type": "text", "text": prompt},
-            {"type": "image_url", "image_url": {"url": f"data:{self.mime};base64,{screenshot_b64}"}},
+            {"type": "image_url", "image_url": {"url": image_data_uri(screenshot_b64, fallback=self.mime)}},
         ]
         try:
             response = self.client.chat.completions.create(

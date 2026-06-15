@@ -16,6 +16,9 @@ class Step:
     expected_state: str = ""
     recovery_steps: List[str] = field(default_factory=list)
     sub_steps: List[str] = field(default_factory=list)
+    preferred_sensor: str = "a11y_tree"
+    risk_level: str = "low"
+    grounding_strategy: str = "semantic_first"
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -60,7 +63,13 @@ class Plan:
 
     @classmethod
     def from_dict(cls, payload: Dict[str, Any]) -> "Plan":
-        steps = [Step(**step) for step in payload.get("steps", [])]
+        steps = []
+        allowed_step_keys = set(Step.__dataclass_fields__.keys())
+        for raw_step in payload.get("steps", []):
+            if not isinstance(raw_step, dict):
+                continue
+            step_payload = {key: value for key, value in raw_step.items() if key in allowed_step_keys}
+            steps.append(Step(**step_payload))
         return cls(
             id=payload.get("id", ""),
             user_prompt=payload.get("user_prompt", ""),

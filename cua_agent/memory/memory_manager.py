@@ -118,7 +118,9 @@ class MemoryManager:
             f"{skill.description}\n"
             f"{skill.semantic_hints or {}}\n"
             f"{skill.parameters or {}}\n"
-            f"{skill.verification_contract or {}}"
+            f"{skill.verification_contract or {}}\n"
+            f"{skill.preconditions or {}}\n"
+            f"{skill.grounding_signature or {}}"
         )
         metadata = {
             "name": str(skill.name or "")[:200],
@@ -267,6 +269,10 @@ class MemoryManager:
         plan_step_id: Optional[str] = None,
         parameters: Optional[Dict[str, Any]] = None,
         verification_contract: Optional[Dict[str, Any]] = None,
+        preconditions: Optional[Dict[str, Any]] = None,
+        postconditions: Optional[Dict[str, Any]] = None,
+        negative_examples: Optional[List[Dict[str, Any]]] = None,
+        grounding_signature: Optional[Dict[str, Any]] = None,
     ) -> ProceduralSkill:
         embedding = None
         semantic_hints = self._extract_semantic_hints(actions)
@@ -276,7 +282,9 @@ class MemoryManager:
                 f"{description}\n"
                 f"{semantic_hints}\n"
                 f"{parameters or {}}\n"
-                f"{verification_contract or {}}"
+                f"{verification_contract or {}}\n"
+                f"{preconditions or {}}\n"
+                f"{grounding_signature or {}}"
             )
             embedding = self._embed_text(text_for_embed)
         skill = self.skill_store.save_skill(
@@ -290,6 +298,10 @@ class MemoryManager:
             semantic_hints=semantic_hints,
             parameters=parameters,
             verification_contract=verification_contract,
+            preconditions=preconditions,
+            postconditions=postconditions,
+            negative_examples=negative_examples,
+            grounding_signature=grounding_signature,
         )
         self._upsert_skill_vector(skill)
         return skill
@@ -302,6 +314,22 @@ class MemoryManager:
 
     def record_skill_usage(self, skill_id: str) -> Optional[ProceduralSkill]:
         skill = self.skill_store.record_usage(skill_id)
+        if skill:
+            self._upsert_skill_vector(skill)
+        return skill
+
+    def record_skill_result(
+        self,
+        skill_id: str,
+        *,
+        success: bool,
+        negative_example: Optional[Dict[str, Any]] = None,
+    ) -> Optional[ProceduralSkill]:
+        skill = self.skill_store.record_result(
+            skill_id,
+            success=success,
+            negative_example=negative_example,
+        )
         if skill:
             self._upsert_skill_vector(skill)
         return skill
@@ -356,6 +384,8 @@ class MemoryManager:
         top_k: int = 3,
         min_vector_score: Optional[float] = None,
         min_keyword_score: Optional[float] = None,
+        context: Optional[Dict[str, Any]] = None,
+        grounding_signature: Optional[Dict[str, Any]] = None,
     ) -> Optional[SkillSearchResult]:
         min_vector = (
             float(min_vector_score)
@@ -371,11 +401,17 @@ class MemoryManager:
         if not results:
             return None
 
-        best = results[0]
-        if best.strategy in {"chroma", "vector"} and best.score >= min_vector:
-            return best
-        if best.strategy == "keyword" and best.score >= min_keyword:
-            return best
+        for candidate in results:
+            if not self._skill_allowed_for_context(
+                candidate.skill,
+                context=context or {},
+                grounding_signature=grounding_signature or {},
+            ):
+                continue
+            if candidate.strategy in {"chroma", "vector"} and candidate.score >= min_vector:
+                return candidate
+            if candidate.strategy == "keyword" and candidate.score >= min_keyword:
+                return candidate
         return None
 
     def _search_skills_chroma(self, query_embedding: List[float], top_k: int) -> List[SkillSearchResult]:
@@ -430,8 +466,61 @@ class MemoryManager:
             + " ".join(param_names)
             + " "
             + verification_blob
+            + " "
+            + json.dumps(getattr(skill, "preconditions", {}) or {}, ensure_ascii=False)
+            + " "
+            + json.dumps(getattr(skill, "grounding_signature", {}) or {}, ensure_ascii=False)
         ).lower()
         skill_tokens = tokenize_lower(text)
         overlap = len(query_tokens & skill_tokens)
         exact = 5 if query_lower in text else 0
         return exact + overlap
+
+    def _skill_allowed_for_context(
+        self,
+        skill: ProceduralSkill,
+        *,
+        context: Dict[str, Any],
+        grounding_signature: Dict[str, Any],
+    ) -> bool:
+        if skill.failure_count >= max(2, skill.success_count + 2):
+            return False
+
+        preconditions = getattr(skill, "preconditions", {}) or {}
+        for key in ("platform", "active_app", "active_window_title", "domain"):
+            expected = str(preconditions.get(key) or "").strip().lower()
+            if not expected:
+                continue
+            actual = str(context.get(key) or "").strip().lower()
+            if not actual or expected not in actual:
+                return False
+
+        required_labels = {
+            str(item).strip().lower()
+            for item in (preconditions.get("labels") or [])
+            if str(item).strip()
+        }
+        if required_labels:
+            labels = {
+                str(item).strip().lower()
+                for item in (grounding_signature.get("labels") or [])
+                if str(item).strip()
+            }
+            if not required_labels.intersection(labels):
+                return False
+
+        skill_signature = getattr(skill, "grounding_signature", {}) or {}
+        skill_labels = {
+            str(item).strip().lower()
+            for item in (skill_signature.get("labels") or [])
+            if str(item).strip()
+        }
+        if skill_labels and grounding_signature:
+            labels = {
+                str(item).strip().lower()
+                for item in (grounding_signature.get("labels") or [])
+                if str(item).strip()
+            }
+            if labels and not skill_labels.intersection(labels):
+                return False
+        return True

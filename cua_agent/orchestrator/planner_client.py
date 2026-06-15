@@ -9,14 +9,16 @@ from typing import Any, Dict, List, Optional
 from cua_agent.memory.memory_manager import Episode, SemanticMemoryItem
 from cua_agent.orchestrator.planning import Plan, Step
 from cua_agent.utils.config import Settings
+from cua_agent.utils.image_mime import configured_image_mime, image_data_uri
 from cua_agent.utils.logger import get_logger
 
 
 class PlannerClient:
     """Turns a user prompt and prior context into a structured plan."""
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, platform_name: str = "desktop") -> None:
         self.settings = settings
+        self.platform_name = platform_name or "desktop"
         self.logger = get_logger(__name__, level=settings.log_level)
         self.client = self._build_client()
 
@@ -56,8 +58,31 @@ class PlannerClient:
                                     "items": {"type": "string"},
                                     "default": [],
                                 },
+                                "preferred_sensor": {
+                                    "type": "string",
+                                    "enum": ["os_telemetry", "a11y_tree", "pixel_diff", "vision_full"],
+                                    "default": "a11y_tree",
+                                },
+                                "risk_level": {
+                                    "type": "string",
+                                    "enum": ["low", "medium", "high"],
+                                    "default": "low",
+                                },
+                                "grounding_strategy": {
+                                    "type": "string",
+                                    "enum": ["semantic_first", "visual_first", "fusion_required"],
+                                    "default": "semantic_first",
+                                },
                             },
-                            "required": ["id", "description", "success_criteria", "status"],
+                            "required": [
+                                "id",
+                                "description",
+                                "success_criteria",
+                                "status",
+                                "expected_state",
+                                "recovery_steps",
+                                "sub_steps",
+                            ],
                             "additionalProperties": False,
                         },
                     },
@@ -89,20 +114,34 @@ class PlannerClient:
     ) -> Plan:
         plan_id = str(uuid.uuid4())
         if not self.client:
+            # No generic step-level expected_state on purpose: resolve_contract would
+            # force it onto every action regardless of the resolved sensor, hard-failing
+            # valid actions (e.g. open_app under os_telemetry, where the snapshot is
+            # clipboard-only) and bypassing the visual fallback. Leaving it empty lets
+            # action-specific defaults and "any"/visual-fallback semantics apply.
             steps = [
-                Step(id=0, description="Inspect the desktop and orient to the request", success_criteria="Relevant app or window is visible and ready", status="in_progress"),
-                Step(id=1, description=f"Execute the task: {user_prompt}", success_criteria="On-screen confirmation of the completed request (visible result, file, or page)"),
+                Step(
+                    id=0,
+                    description="Inspect the desktop and orient to the request",
+                    success_criteria="Relevant app or window is visible and ready",
+                    status="in_progress",
+                ),
+                Step(
+                    id=1,
+                    description=f"Execute the task: {user_prompt}",
+                    success_criteria="On-screen confirmation of the completed request (visible result, file, or page)",
+                ),
             ]
             return Plan(id=plan_id, user_prompt=user_prompt, steps=steps, current_step_index=0)
 
         context = self._format_memory_context(prior_episodes or [], prior_semantic or [])
-        mime = "image/png" if self.settings.encode_format.lower() == "png" else "image/jpeg"
+        fallback_mime = configured_image_mime(self.settings.encode_format)
         
         system_prompt = (
             "You are a task planner for a desktop agent. "
             "First, THINK step-by-step about the user request, the current screen state, and potential obstacles. "
             "Then, output a JSON object with an ordered `steps` array.\n"
-            "Each step must have: id (int), description (string), success_criteria (string), status (pending|in_progress|done|failed), notes (string), expected_state (string), recovery_steps (array of strings), sub_steps (array of strings).\n"
+            "Each step must have: id (int), description (string), success_criteria (string), status (pending|in_progress|done|failed), notes (string), expected_state (string), recovery_steps (array of strings), sub_steps (array of strings), preferred_sensor, risk_level, grounding_strategy.\n"
             "- Split the task into 3-7 small, verifiable steps. Keep main steps HIGH-LEVEL and list concrete clicks/fields in sub_steps.\n"
             "- Apply SMART goal principles.\n"
             "- 'sub_steps': Break complex steps into atomic actions (e.g. 'Click File', 'Select Print').\n"
@@ -119,7 +158,7 @@ class PlannerClient:
         ]
         if screenshot_b64:
             user_content.append(
-                {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{screenshot_b64}"}}
+                {"type": "image_url", "image_url": {"url": image_data_uri(screenshot_b64, fallback=fallback_mime)}}
             )
 
         try:
@@ -138,9 +177,20 @@ class PlannerClient:
             return Plan.from_dict(plan_dict)
         except Exception as exc:  # pragma: no cover - defensive path
             self.logger.warning("Planner call failed; using fallback plan: %s", exc)
+            # See the no-client fallback above: avoid generic step-level expected_state
+            # so valid actions are not hard-failed by a sensor-incompatible contract.
             steps = [
-                Step(id=0, description="Inspect the desktop and orient to the request", success_criteria="Relevant app or window is visible and ready", status="in_progress"),
-                Step(id=1, description=f"Execute the task: {user_prompt}", success_criteria="On-screen confirmation of the completed request (visible result, file, or page)"),
+                Step(
+                    id=0,
+                    description="Inspect the desktop and orient to the request",
+                    success_criteria="Relevant app or window is visible and ready",
+                    status="in_progress",
+                ),
+                Step(
+                    id=1,
+                    description=f"Execute the task: {user_prompt}",
+                    success_criteria="On-screen confirmation of the completed request (visible result, file, or page)",
+                ),
             ]
             return Plan(id=plan_id, user_prompt=user_prompt, steps=steps, current_step_index=0)
 
@@ -150,12 +200,12 @@ class PlannerClient:
             self.logger.info("Planner revision skipped: client unavailable.")
             return plan
 
-        mime = "image/png" if self.settings.encode_format.lower() == "png" else "image/jpeg"
+        fallback_mime = configured_image_mime(self.settings.encode_format)
         system_prompt = (
-            "You are revising an in-flight macOS desktop plan. "
+            f"You are revising an in-flight {self.platform_name} desktop plan. "
             "First, REASON about the failure or current state. "
             "Then, output an UPDATED plan JSON.\n"
-            "Schema: id, user_prompt, steps (id, description, success_criteria, status, notes, expected_state, recovery_steps, sub_steps), current_step_index.\n"
+            "Schema: id, user_prompt, steps (id, description, success_criteria, status, notes, expected_state, recovery_steps, sub_steps, preferred_sensor, risk_level, grounding_strategy), current_step_index.\n"
             "- Keep 3-7 concise steps.\n"
             "- 'success_criteria' must be VISUAL.\n"
             "- Mark steps as done if satisfied.\n"
@@ -174,7 +224,7 @@ class PlannerClient:
                     + "\n".join(history[-40:])
                 ),
             },
-            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{screenshot_b64}"}},
+            {"type": "image_url", "image_url": {"url": image_data_uri(screenshot_b64, fallback=fallback_mime)}},
         ]
 
         try:
@@ -258,26 +308,111 @@ class PlannerClient:
                     status=str(raw.get("status", "pending")),
                     notes=str(raw.get("notes", "")),
                     expected_state=str(raw.get("expected_state", "")),
-                    recovery_steps=raw.get("recovery_steps", []),
-                    sub_steps=raw.get("sub_steps", []),
+                    recovery_steps=self._string_list(raw.get("recovery_steps", [])),
+                    sub_steps=self._string_list(raw.get("sub_steps", [])),
+                    preferred_sensor=self._enum_value(
+                        raw.get("preferred_sensor"),
+                        {"os_telemetry", "a11y_tree", "pixel_diff", "vision_full"},
+                        "a11y_tree",
+                    ),
+                    risk_level=self._enum_value(raw.get("risk_level"), {"low", "medium", "high"}, "low"),
+                    grounding_strategy=self._enum_value(
+                        raw.get("grounding_strategy"),
+                        {"semantic_first", "visual_first", "fusion_required"},
+                        "semantic_first",
+                    ),
                 )
                 steps.append(step)
             except Exception:
                 continue
         if not steps:
             steps = [
-                Step(id=0, description="Inspect the desktop and orient to the request", success_criteria="Relevant app or window is visible and ready", status="in_progress"),
-                Step(id=1, description=f"Execute the task: {user_prompt}", success_criteria="On-screen confirmation of the completed request (visible result, file, or page)"),
+                Step(
+                    id=0,
+                    description="Inspect the desktop and orient to the request",
+                    success_criteria="Relevant app or window is visible and ready",
+                    expected_state="text_exists:ready",
+                    status="in_progress",
+                ),
+                Step(
+                    id=1,
+                    description=f"Execute the task: {user_prompt}",
+                    success_criteria="On-screen confirmation of the completed request (visible result, file, or page)",
+                    expected_state="state_change",
+                ),
             ]
-        if steps and steps[0].status == "pending":
-            steps[0].status = "in_progress"
+        plan = Plan(
+            id=data.get("id", plan_id),
+            user_prompt=data.get("user_prompt", user_prompt),
+            steps=steps,
+            current_step_index=data.get("current_step_index", 0),
+        )
+        plan = self._repair_plan_invariants(plan)
 
-        return {
-            "id": data.get("id", plan_id),
-            "user_prompt": data.get("user_prompt", user_prompt),
-            "steps": [s.to_dict() for s in steps],
-            "current_step_index": data.get("current_step_index", 0),
-        }
+        return plan.to_dict()
+
+    def _repair_plan_invariants(self, plan: Plan) -> Plan:
+        if not plan.steps:
+            return plan
+
+        allowed_status = {"pending", "in_progress", "done", "failed"}
+        allowed_sensors = {"os_telemetry", "a11y_tree", "pixel_diff", "vision_full"}
+        allowed_risk = {"low", "medium", "high"}
+        allowed_grounding = {"semantic_first", "visual_first", "fusion_required"}
+
+        for idx, step in enumerate(plan.steps):
+            if step.status not in allowed_status:
+                step.status = "pending"
+            if not step.expected_state:
+                step.expected_state = step.success_criteria or step.description
+            step.recovery_steps = self._string_list(step.recovery_steps)
+            step.sub_steps = self._string_list(step.sub_steps)
+            step.preferred_sensor = self._enum_value(step.preferred_sensor, allowed_sensors, "a11y_tree")
+            step.risk_level = self._enum_value(step.risk_level, allowed_risk, "low")
+            step.grounding_strategy = self._enum_value(
+                step.grounding_strategy, allowed_grounding, "semantic_first"
+            )
+            if not isinstance(step.id, int):
+                step.id = idx
+
+        try:
+            current_idx = int(plan.current_step_index)
+        except (TypeError, ValueError):
+            current_idx = 0
+        if current_idx < 0:
+            current_idx = 0
+
+        in_progress_indices = [i for i, step in enumerate(plan.steps) if step.status == "in_progress"]
+        if in_progress_indices:
+            current_idx = in_progress_indices[0]
+        elif current_idx >= len(plan.steps) or plan.steps[current_idx].status in {"done", "failed"}:
+            # Out-of-range or already-resolved index: repair to the first open step so we
+            # never drop step context while steps remain pending. When every step is
+            # done/failed, first_open == len(steps), which correctly marks the plan complete.
+            current_idx = next(
+                (i for i, step in enumerate(plan.steps) if step.status not in {"done", "failed"}),
+                len(plan.steps),
+            )
+
+        if current_idx < len(plan.steps):
+            for idx, step in enumerate(plan.steps):
+                if idx < current_idx and step.status in {"pending", "in_progress"}:
+                    step.status = "done"
+                elif idx == current_idx:
+                    step.status = "in_progress"
+                elif idx > current_idx and step.status == "in_progress":
+                    step.status = "pending"
+        plan.current_step_index = current_idx
+        return plan
+
+    def _string_list(self, value: Any) -> List[str]:
+        if not isinstance(value, list):
+            return []
+        return [str(item).strip() for item in value if str(item).strip()]
+
+    def _enum_value(self, value: Any, allowed: set[str], default: str) -> str:
+        token = str(value or "").strip().lower()
+        return token if token in allowed else default
 
     def _format_memory_context(self, episodes: List[Episode], semantic_items: List[SemanticMemoryItem]) -> str:
         chunks: List[str] = []
