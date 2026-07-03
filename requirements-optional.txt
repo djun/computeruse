@@ -1,0 +1,16 @@
+# Optional dependencies, each gated by a feature flag. The core degrades
+# gracefully when these are absent: every import below is lazy and wrapped in
+# try/except, so the base install in requirements.txt runs without them.
+#
+# Install with: pip install -r requirements-optional.txt
+
+# ENABLE_CHROMA_SKILLS=true — local vector index for procedural skills
+chromadb>=0.5.0
+
+# ENABLE_DEBUG_DASHBOARD=true — live observability dashboard (FastAPI + uvicorn)
+fastapi>=0.115.0
+uvicorn>=0.30.0
+
+# ENABLE_VISUAL_DETECTOR=true with VISUAL_DETECTOR_BACKEND=ultralytics —
+# YOLO-style visual UI element detector for the vision fallback path
+ultralytics>=8.0.0

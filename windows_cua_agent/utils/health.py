@@ -89,14 +89,14 @@ def run_permission_health_checks(settings: Settings, logger: Any | None = None) 
         logger.info("Windows integrity=%s elevated=%s", info.integrity, info.elevated)
 
         # Low/untrusted integrity can break cross-process UIA/HID behavior.
-        if info.integrity in {"untrusted", "low"} and (settings.enable_hid or settings.enable_semantic):
+        if info.integrity in {"untrusted", "low"} and (settings.sends_real_input() or settings.enable_semantic):
             raise RuntimeError(
                 "Process is running at low/untrusted integrity; Windows UI automation may be blocked. "
                 "Run from a normal desktop session (medium integrity) and try again."
             )
 
         # If the agent is not elevated, it cannot send input to elevated windows (UIPI).
-        if settings.enable_hid and not info.elevated:
+        if settings.sends_real_input() and not info.elevated:
             if getattr(settings, "windows_auto_elevate", True):
                 _attempt_relaunch_as_admin(logger)
             logger.warning(

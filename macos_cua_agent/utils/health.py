@@ -22,7 +22,7 @@ def run_permission_health_checks(settings, logger=None) -> None:
     if not has_screen_recording_permission():
         missing.append("Screen Recording")
 
-    if (settings.enable_hid or settings.enable_semantic) and not has_accessibility_permission():
+    if (settings.sends_real_input() or settings.enable_semantic) and not has_accessibility_permission():
         missing.append("Accessibility")
 
     if missing:

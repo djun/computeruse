@@ -9,5 +9,6 @@ __pycache__/
 *.py[cod]
 /*/.agent_memory
 /*/.agent_shell
+/.agent_memory/
 /.agent_shell/
 .DS_Store

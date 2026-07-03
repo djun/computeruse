@@ -1,11 +1,11 @@
 import logging
 
+from cua_agent.memory.skill_composer import SkillComposer
 from cua_agent.memory.skill_store import ProceduralSkill, SkillStore
-from cua_agent.orchestrator.orchestrator import Orchestrator
 
 
-def _orchestrator() -> Orchestrator:
-    return Orchestrator.__new__(Orchestrator)
+def _composer() -> SkillComposer:
+    return SkillComposer()
 
 
 def _skill() -> ProceduralSkill:
@@ -65,10 +65,10 @@ def test_skill_store_persists_parameters_and_verification_contract(tmp_path) -> 
 
 
 def test_materialize_skill_actions_applies_runtime_args() -> None:
-    orchestrator = _orchestrator()
+    composer = _composer()
     skill = _skill()
 
-    actions, resolved_args, missing = orchestrator._materialize_skill_actions(
+    actions, resolved_args, missing = composer._materialize_skill_actions(
         skill,
         {"query_text": "teclado mecanico"},
     )
@@ -77,24 +77,38 @@ def test_materialize_skill_actions_applies_runtime_args() -> None:
     assert resolved_args["query_text"] == "teclado mecanico"
     assert actions[1]["text"] == "teclado mecanico"
 
-    contract = orchestrator._render_skill_verification_contract(skill, resolved_args)
+    contract = composer._render_skill_verification_contract(skill, resolved_args)
     assert contract["expected_state"] == "text_exists:teclado mecanico"
 
 
 def test_materialize_skill_actions_requires_missing_required_args() -> None:
-    orchestrator = _orchestrator()
+    composer = _composer()
     skill = _skill()
 
-    actions, _, missing = orchestrator._materialize_skill_actions(skill, {})
+    actions, _, missing = composer._materialize_skill_actions(skill, {})
 
     assert actions[1]["text"] == "{query_text}"
     assert "query_text" in missing
 
 
-def test_build_composable_skill_payload_creates_parameter_templates() -> None:
-    orchestrator = _orchestrator()
+def test_skill_context_metadata_stamps_platform_precondition() -> None:
+    actions = [{"type": "left_click", "semantic_label": "Submit", "semantic_role": "AXButton"}]
+    pre, sig = SkillComposer(platform_name="macOS")._skill_context_metadata(actions)
+    assert pre["platform"] == "macOS"
+    assert "Submit" in sig["labels"]
 
-    templated, parameters = orchestrator._build_composable_skill_payload(
+
+def test_skill_context_metadata_omits_platform_when_unknown() -> None:
+    # Blank platform => no precondition => the fast-path filter stays platform-agnostic
+    # (regression: previously stamped "unknown" and rejected every learned skill).
+    pre, _ = SkillComposer()._skill_context_metadata([{"type": "left_click"}])
+    assert "platform" not in pre
+
+
+def test_build_composable_skill_payload_creates_parameter_templates() -> None:
+    composer = _composer()
+
+    templated, parameters = composer._build_composable_skill_payload(
         [
             {"type": "open_app", "app_name": "Google Chrome"},
             {"type": "type", "text": "Relatorio financeiro janeiro"},

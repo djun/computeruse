@@ -145,3 +145,35 @@ def test_system_prompt_uses_registry_status_for_builtin_overrides() -> None:
     call_kwargs = core.client.chat.completions.create.call_args[1]
     system_prompt = call_kwargs["messages"][0]["content"]
     assert "Browser tool is disabled in this execution profile" in system_prompt
+
+
+def _system_prompt_for(settings: Settings) -> str:
+    core = CognitiveCore(settings, _DummyComputer())
+    core.client = MagicMock()
+    core.client.chat.completions.create.return_value = SimpleNamespace(choices=[])
+    core._call_openrouter(
+        observation_b64="",
+        history=[],
+        include_visual_context=True,
+        user_prompt="do it",
+        repeat_info=None,
+        plan=None,
+        current_step=None,
+        loop_state=None,
+        ax_tree=None,
+        som_tags=None,
+        relevant_skills=None,
+    )
+    return core.client.chat.completions.create.call_args[1]["messages"][0]["content"]
+
+
+def test_grounding_guidance_native_coordinates_mode() -> None:
+    prompt = _system_prompt_for(Settings(use_openrouter=False, prefer_native_coordinates=True))
+    assert "native x/y pixel" in prompt
+    assert "numbered overlay marks to ground actions" not in prompt
+
+
+def test_grounding_guidance_set_of_mark_mode() -> None:
+    prompt = _system_prompt_for(Settings(use_openrouter=False, prefer_native_coordinates=False))
+    assert "numbered overlay marks to ground actions" in prompt
+    assert "return native x/y pixel" not in prompt

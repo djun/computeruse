@@ -11,6 +11,7 @@ from cua_agent.orchestrator.planning import Plan, Step
 from cua_agent.utils.config import Settings
 from cua_agent.utils.image_mime import configured_image_mime, image_data_uri
 from cua_agent.utils.logger import get_logger
+from cua_agent.utils.token_usage import usage_tokens
 
 
 class PlannerClient:
@@ -21,6 +22,7 @@ class PlannerClient:
         self.platform_name = platform_name or "desktop"
         self.logger = get_logger(__name__, level=settings.log_level)
         self.client = self._build_client()
+        self.tokens_used = 0
 
     def _plan_json_schema(self) -> Dict[str, Any]:
         """JSON schema for structured plan outputs."""
@@ -171,6 +173,7 @@ class PlannerClient:
                 response_format={"type": "json_schema", "json_schema": self._plan_json_schema()},
                 extra_body={"structured_outputs": {"type": "json_schema", "json_schema": self._plan_json_schema()}},
             )
+            self.tokens_used += usage_tokens(response)
             message = response.choices[0].message if response and response.choices else None
             content = message.content if message else "{}"
             plan_dict = self._parse_plan_response(message or content, plan_id, user_prompt)
@@ -237,6 +240,7 @@ class PlannerClient:
                 response_format={"type": "json_schema", "json_schema": self._plan_json_schema()},
                 extra_body={"structured_outputs": {"type": "json_schema", "json_schema": self._plan_json_schema()}},
             )
+            self.tokens_used += usage_tokens(response)
             message = response.choices[0].message if response and response.choices else None
             content = message.content if message else "{}"
             plan_dict = self._parse_plan_response(message or content, plan.id, plan.user_prompt)
@@ -450,6 +454,7 @@ class PlannerClient:
                     {"role": "user", "content": user_block},
                 ],
             )
+            self.tokens_used += usage_tokens(response)
             content = response.choices[0].message.content if response and response.choices else ""
             if isinstance(content, list):
                 content = "".join([frag.text for frag in content if hasattr(frag, "text")])  # type: ignore
@@ -477,6 +482,7 @@ class PlannerClient:
                 ],
                 max_tokens=200,
             )
+            self.tokens_used += usage_tokens(response)
             content = response.choices[0].message.content if response and response.choices else ""
             return str(content or "").strip()
         except Exception:

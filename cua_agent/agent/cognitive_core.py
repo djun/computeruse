@@ -12,6 +12,7 @@ from cua_agent.orchestrator.react_types import ActionEnvelope, GroundingBundle
 from cua_agent.utils.config import Settings
 from cua_agent.utils.image_mime import configured_image_mime, image_data_uri
 from cua_agent.utils.logger import get_logger
+from cua_agent.utils.token_usage import usage_tokens
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from cua_agent.orchestrator.planning import Plan, Step
@@ -130,6 +131,13 @@ COMPUTER_TOOL = {
                 "radius": {
                     "type": "number",
                     "description": "Radius (in logical points) for probe_ui to include nearby elements.",
+                },
+                "region": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "minItems": 4,
+                    "maxItems": 4,
+                    "description": "For 'zoom': [x1,y1,x2,y2] region in logical points to re-capture at higher detail. Return follow-up coordinates in the original screenshot space.",
                 },
                 "text": {"type": "string", "description": "Text to type."},
                 "app_name": {"type": "string", "description": "Name of the application to open (for 'open_app' action)."},
@@ -413,6 +421,7 @@ class CognitiveCore:
         self._tool_order: List[str] = []
         self._register_default_tools()
         self.client = self._build_client()
+        self.tokens_used = 0
         self._log_execution_profile_startup()
 
     def _tool_enabled_map(self) -> Dict[str, bool]:
@@ -714,11 +723,17 @@ class CognitiveCore:
                     f"confidence={tag.get('confidence', 0.0)} role={tag.get('role','')} label={tag.get('label','')} "
                     f"frame=({frame.get('x','?')},{frame.get('y','?')},{frame.get('w','?')},{frame.get('h','?')}) (logical pts)"
                 )
-            som_context = (
-                "\nNumbered overlay marks are drawn on the screenshot. "
-                "Use element_id to reference these instead of guessing coordinates.\n"
-                + "\n".join(som_lines)
-            )
+            if self.settings.prefer_native_coordinates:
+                som_header = (
+                    "\nDetected UI elements (optional aids; prefer reading the raw screenshot "
+                    "and returning native x/y). You MAY pass element_id to reuse one of these:\n"
+                )
+            else:
+                som_header = (
+                    "\nNumbered overlay marks are drawn on the screenshot. "
+                    "Use element_id to reference these instead of guessing coordinates.\n"
+                )
+            som_context = som_header + "\n".join(som_lines)
 
         grounding_context = ""
         if grounding:
@@ -808,6 +823,25 @@ class CognitiveCore:
             else "- This turn has no screenshot. Re-plan from history + semantic state only; if uncertain, request `vision_full` verification."
         )
 
+        if self.settings.prefer_native_coordinates:
+            grounding_guidance = (
+                "- Ground actions by reading the raw screenshot and returning native x/y pixel "
+                "coordinates (logical display points; screenshot is already downscaled to logical resolution).\n"
+                "            - The accessibility tree and detected-element list are optional aids; you MAY pass "
+                "`element_id` to reuse a listed element, but you do not need overlay marks to act.\n"
+                "            - Prefer semantic/fused targets for accessible controls; fall back to x/y for anything "
+                "not covered by AX/UIA."
+            )
+        else:
+            grounding_guidance = (
+                "- Use the provided Accessibility Tree and numbered overlay marks to ground actions. If a tag "
+                "exists, return its ID via `element_id` instead of guessing coordinates.\n"
+                "            - Prefer fused candidates when available. Use semantic/fused targets for accessible "
+                "controls and visual targets for controls missing from AX/UIA.\n"
+                "            - Coordinates: only provide x/y when no overlay tag is available. If using x/y, return "
+                "logical display points (screenshot is already downscaled to logical resolution)."
+            )
+
         system_prompt = f"""
             You are a high-efficiency {self.platform_name} autonomous desktop operator.
             Execution profile: {self.settings.execution_profile}.
@@ -828,11 +862,9 @@ class CognitiveCore:
             Planning & Thinking
             {visual_context_line}
             - Always reason from what is currently visible: windows, icons, menus.
-            - Use the provided Accessibility Tree and numbered overlay marks to ground actions. If a tag exists, return its ID via `element_id` instead of guessing coordinates.
-            - Prefer fused candidates when available. Use semantic/fused targets for accessible controls and visual targets for controls missing from AX/UIA.
+            {grounding_guidance}
             - Keep any non-tool text to a short operational summary; do not expose long reasoning.
             - Use `inspect_ui` if visual elements are ambiguous or you need to find hidden controls.
-            - Coordinates: only provide x/y when no overlay tag is available. If using x/y, return logical display points (screenshot is already downscaled to logical resolution).
             - To reduce latency, prefer batching obvious sequences (e.g., click + type + enter) using `actions`.
             - Sensor pyramid (prefer cheapest): `none` -> `os_telemetry` -> `a11y_tree` -> `pixel_diff` -> `vision_full`.
             - Use `vision_full` only when context is lost, UI is purely visual, or cheaper validation failed.
@@ -903,13 +935,15 @@ class CognitiveCore:
             if reasoning_config:
                 extra_body["reasoning"] = reasoning_config
 
-        return self.client.chat.completions.create(
+        response = self.client.chat.completions.create(
             model=self.settings.openrouter_model,
             messages=messages,
             tools=self._available_tools(),
             tool_choice="auto",
             extra_body=extra_body if extra_body else None,
         )
+        self.tokens_used += usage_tokens(response)
+        return response
 
     def _available_tools(self) -> List[Dict[str, Any]]:
         self._ensure_tool_registry()
@@ -1110,6 +1144,19 @@ class CognitiveCore:
                 payload["radius"] = float(args.get("radius"))
             return _apply_verify(payload)
 
+        if action_l == "zoom":
+            region = args.get("region")
+            if not isinstance(region, (list, tuple)) or len(region) < 4:
+                return {"type": "noop", "reason": "zoom requires region [x1,y1,x2,y2]"}
+            try:
+                box = [float(v) for v in list(region)[:4]]
+            except (TypeError, ValueError):
+                return {"type": "noop", "reason": "zoom region must be numeric"}
+            payload = {"type": "zoom", "region": box, "verify_after": False}
+            if args.get("upscale") is not None:
+                payload["upscale"] = args.get("upscale")
+            return payload
+
         if action_l == "clipboard_op":
             sub = args.get("sub_action")
             if not sub:
@@ -1285,6 +1332,7 @@ class CognitiveCore:
             "wait_for_element",
             "wait_for_idle",
             "screenshot",
+            "zoom",
             "inspect_ui",
             "probe_ui",
             "read_clipboard",

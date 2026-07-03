@@ -9,6 +9,7 @@ from cua_agent.orchestrator.planning import Step
 from cua_agent.utils.config import Settings
 from cua_agent.utils.image_mime import configured_image_mime, image_data_uri
 from cua_agent.utils.logger import get_logger
+from cua_agent.utils.token_usage import usage_tokens
 
 
 @dataclass
@@ -27,6 +28,7 @@ class Reflector:
         self.logger = get_logger(__name__, level=settings.log_level)
         self.client = self._build_client()
         self.mime = configured_image_mime(settings.encode_format)
+        self.tokens_used = 0
 
     def _build_client(self) -> Optional[object]:
         if not self.settings.enable_reflection:
@@ -108,6 +110,7 @@ class Reflector:
                     }
                 },
             )
+            self.tokens_used += usage_tokens(response)
             raw = response.choices[0].message.content if response and response.choices else "{}"
             import json
             data = json.loads(raw or "{}")
@@ -151,6 +154,7 @@ class Reflector:
                 ],
                 max_tokens=1000,
             )
+            self.tokens_used += usage_tokens(response)
             raw = response.choices[0].message.content if response and response.choices else ""
             return "".join([frag.text for frag in raw]) if isinstance(raw, list) else str(raw or "")
         except Exception as exc:  # pragma: no cover - defensive path
@@ -180,6 +184,7 @@ class Reflector:
                 ],
                 max_tokens=500,
             )
+            self.tokens_used += usage_tokens(response)
             raw = response.choices[0].message.content if response and response.choices else ""
             return "".join([frag.text for frag in raw]) if isinstance(raw, list) else str(raw or "")
         except Exception as exc:  # pragma: no cover - defensive path

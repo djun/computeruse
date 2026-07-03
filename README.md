@@ -20,10 +20,12 @@ Architecture boundary: core business logic lives in `cua_agent/`; adapter packag
 - Execution profiles to constrain tooling by context: `local_gui`, `remote_cli`, or `hybrid`.
 
 **Requirements**
-- Python 3.11+; install deps with `pip install -r requirements.txt`.
+- Python 3.11+; install base deps with `pip install -r requirements.txt`.
+- Optional feature deps live in `requirements-optional.txt` (`pip install -r requirements-optional.txt`); each is gated by a feature flag and the core degrades gracefully without it:
+  - `chromadb` — local skill vector indexing (`ENABLE_CHROMA_SKILLS=true`).
+  - `fastapi` + `uvicorn` — live debug dashboard (`ENABLE_DEBUG_DASHBOARD=true`).
+  - `ultralytics` — detector-assisted visual grounding (`ENABLE_VISUAL_DETECTOR=true`).
 - Optional: `brew install tesseract` to improve OCR for the visual fallback path.
-- Optional: install `ultralytics` and set `ENABLE_VISUAL_DETECTOR=true` for detector-assisted visual grounding.
-- ChromaDB is included in `requirements.txt` and can be enabled for local skill vector indexing (`ENABLE_CHROMA_SKILLS=true`).
 - OpenRouter account/key to drive the planner, cognitive core, and reflector models; without a key the agent runs in noop/stub mode.
 
 **Run**
@@ -44,11 +46,10 @@ Architecture boundary: core business logic lives in `cua_agent/`; adapter packag
   - `DEBUG_DASHBOARD_PORT=8765`
 - Strict post-action validation (recommended):
   - `STRICT_POST_ACTION_STATE_CHANGE=true`
-- Recommended for procedural fast-path in production:
-  - `ENABLE_EMBEDDINGS=true`
+- Procedural fast-path (the keyword path needs no extra dependency):
   - `ENABLE_FAST_PATH_SKILLS=true`
-  - `ENABLE_CHROMA_SKILLS=true`
-  - `CHROMA_PERSIST_DIR=.agent_memory/chroma`
+  - Optional vector retrieval on top (heavy dep, from `requirements-optional.txt`):
+    `ENABLE_EMBEDDINGS=true`, `ENABLE_CHROMA_SKILLS=true`, `CHROMA_PERSIST_DIR=.agent_memory/chroma`
 
 **Testing**
 - `pytest`

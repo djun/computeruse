@@ -17,8 +17,10 @@ from macos_cua_agent.drivers.browser_driver import BrowserDriver
 from macos_cua_agent.drivers.shell_driver import ShellDriver
 from macos_cua_agent.drivers.vision_pipeline import VisionPipeline
 from cua_agent.memory.memory_manager import MemoryManager
+from cua_agent.memory.skill_composer import SkillComposer
 from cua_agent.orchestrator.orchestrator import Orchestrator
 from cua_agent.orchestrator.planning import Step
+from cua_agent.orchestrator.verification_manager import VerificationManager
 from cua_agent.policies.policy_engine import PolicyEngine, PolicyDecision
 from cua_agent.utils.config import Settings
 
@@ -614,6 +616,7 @@ class TestExtensions(unittest.TestCase):
         orchestrator.settings = Settings(dynamic_skill_min_actions=3)
         orchestrator.logger = MagicMock()
         orchestrator.memory = MagicMock()
+        orchestrator.skill_composer = SkillComposer()
 
         step = Step(id=7, description="Confirm cancellation", success_criteria="Cancellation confirmed")
         trace = [
@@ -721,7 +724,7 @@ class TestExtensions(unittest.TestCase):
         redacted = Image.new("RGB", (32, 32), color=(0, 0, 0))
 
         with patch.object(pipeline, "_grab_frame", return_value=source), patch(
-            "macos_cua_agent.drivers.vision_pipeline.redact_sensitive_regions",
+            "cua_agent.computer.vision_pipeline_base.redact_sensitive_regions",
             return_value=(redacted, 1),
         ) as mock_redact:
             image_b64 = pipeline.capture_base64()
@@ -745,7 +748,7 @@ class TestExtensions(unittest.TestCase):
         source = Image.new("RGB", (32, 32), color=(255, 255, 255))
 
         with patch.object(pipeline, "_grab_frame", return_value=source), patch(
-            "macos_cua_agent.drivers.vision_pipeline.redact_sensitive_regions",
+            "cua_agent.computer.vision_pipeline_base.redact_sensitive_regions",
             return_value=(source, 0),
         ) as mock_redact:
             pipeline.capture_base64()
@@ -813,8 +816,8 @@ class TestExtensions(unittest.TestCase):
         self.assertEqual(contract.timeout_seconds, 1)
 
     def test_orchestrator_resolves_contract_with_step_expected_state(self):
-        orchestrator = Orchestrator.__new__(Orchestrator)
-        orchestrator.settings = Settings()
+        verifier = VerificationManager.__new__(VerificationManager)
+        verifier.settings = Settings()
         step = Step(
             id=1,
             description="submit login",
@@ -822,14 +825,14 @@ class TestExtensions(unittest.TestCase):
             expected_state="text_exists:Dashboard",
         )
         state = StateManager()
-        contract = Orchestrator._resolve_verification_contract(orchestrator, state, {"type": "left_click"}, step)
+        contract = verifier.resolve_contract(state, {"type": "left_click"}, step)
         self.assertEqual(contract.sensor, "a11y_tree")
         self.assertEqual(contract.expected_state, "text_exists:Dashboard")
 
     def test_orchestrator_a11y_fallback_accepts_visual_change_when_a11y_unavailable(self):
-        orchestrator = Orchestrator.__new__(Orchestrator)
-        orchestrator._verify_a11y_tree = MagicMock(return_value=(False, "a11y capture failed", None))
-        orchestrator._run_visual_verification = MagicMock(
+        verifier = VerificationManager.__new__(VerificationManager)
+        verifier.verify_a11y_tree = MagicMock(return_value=(False, "a11y capture failed", None))
+        verifier.run_visual_verification = MagicMock(
             return_value={
                 "passed": True,
                 "reason": "visual changed",
@@ -846,8 +849,7 @@ class TestExtensions(unittest.TestCase):
             }
         )
 
-        result = Orchestrator._run_verification_contract(
-            orchestrator,
+        result = verifier.run_verification_contract(
             action={"type": "left_click"},
             contract=VerificationContract(sensor="a11y_tree", timeout_seconds=1),
             current_frame="frame_before",
@@ -855,7 +857,7 @@ class TestExtensions(unittest.TestCase):
             ax_tree_before=None,
             telemetry_before={},
             global_hotkeys=set(),
-            phash_static_threshold=4,
+            visual_hash_static_threshold=4,
         )
 
         self.assertTrue(result["passed"])
@@ -864,9 +866,9 @@ class TestExtensions(unittest.TestCase):
         self.assertIn("visual fallback detected change", result["reason"])
 
     def test_orchestrator_a11y_fallback_keeps_failure_for_real_a11y_mismatch(self):
-        orchestrator = Orchestrator.__new__(Orchestrator)
-        orchestrator._verify_a11y_tree = MagicMock(return_value=(False, "a11y text not found", {"role": "AXWindow"}))
-        orchestrator._run_visual_verification = MagicMock(
+        verifier = VerificationManager.__new__(VerificationManager)
+        verifier.verify_a11y_tree = MagicMock(return_value=(False, "a11y text not found", {"role": "AXWindow"}))
+        verifier.run_visual_verification = MagicMock(
             return_value={
                 "passed": True,
                 "reason": "visual changed",
@@ -883,8 +885,7 @@ class TestExtensions(unittest.TestCase):
             }
         )
 
-        result = Orchestrator._run_verification_contract(
-            orchestrator,
+        result = verifier.run_verification_contract(
             action={"type": "left_click"},
             contract=VerificationContract(sensor="a11y_tree", expected_state="text_exists:Done", timeout_seconds=1),
             current_frame="frame_before",
@@ -892,7 +893,7 @@ class TestExtensions(unittest.TestCase):
             ax_tree_before={"role": "AXWindow"},
             telemetry_before={},
             global_hotkeys=set(),
-            phash_static_threshold=4,
+            visual_hash_static_threshold=4,
         )
 
         self.assertFalse(result["passed"])
@@ -901,14 +902,13 @@ class TestExtensions(unittest.TestCase):
         self.assertEqual(result["note"], "verification:a11y_tree:timeout")
 
     def test_os_telemetry_state_change_ignores_timestamp_noise(self):
-        orchestrator = Orchestrator.__new__(Orchestrator)
+        verifier = VerificationManager.__new__(VerificationManager)
         contract = VerificationContract(sensor="os_telemetry", timeout_seconds=2)
-        orchestrator._read_clipboard_snapshot = MagicMock(return_value="stable")
+        verifier._read_clipboard_snapshot = MagicMock(return_value="stable")
 
-        before_snapshot = Orchestrator._collect_os_telemetry_snapshot(orchestrator, contract)
-        after_snapshot = Orchestrator._collect_os_telemetry_snapshot(orchestrator, contract)
-        changed, reason = Orchestrator._evaluate_os_telemetry_state(
-            orchestrator,
+        before_snapshot = verifier.collect_os_telemetry_snapshot(contract)
+        after_snapshot = verifier.collect_os_telemetry_snapshot(contract)
+        changed, reason = verifier.evaluate_os_telemetry_state(
             "state_change",
             before_snapshot,
             after_snapshot,
@@ -922,6 +922,7 @@ class TestExtensions(unittest.TestCase):
     def test_fast_path_without_reflector_requires_change_signal(self):
         orchestrator = Orchestrator.__new__(Orchestrator)
         orchestrator.logger = MagicMock()
+        orchestrator.skill_composer = SkillComposer()
         orchestrator._persist_fast_path_episode = MagicMock()
 
         skill = MagicMock()

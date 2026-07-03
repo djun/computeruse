@@ -63,6 +63,8 @@ class VerificationManager:
             "hover",
             "scroll",
             "scroll_to_element",
+            "zoom",
+            "screenshot",
         }:
             return "none"
         if action_type in {"sandbox_shell", "script_op"}:

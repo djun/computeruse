@@ -3,6 +3,7 @@ from __future__ import annotations
 from importlib.resources import as_file, files
 
 from cua_agent.computer.adapter import ComputerAdapter
+from cua_agent.computer.base_computer import DriverBackedComputerAdapter
 from cua_agent.computer.drivers import BaseVisionPipeline
 from cua_agent.policies.policy_engine import PolicyEngine
 from cua_agent.utils.config import Settings
@@ -12,7 +13,7 @@ from macos_cua_agent.utils.health import run_permission_health_checks
 from macos_cua_agent.utils.macos_integration import get_display_info, get_system_info
 
 
-class MacOSComputer(ComputerAdapter):
+class MacOSComputer(DriverBackedComputerAdapter):
     platform_name = "macOS"
 
     def __init__(self, settings: Settings) -> None:
@@ -35,33 +36,6 @@ class MacOSComputer(ComputerAdapter):
 
     def run_health_checks(self, settings: Settings, logger=None) -> None:
         run_permission_health_checks(settings, logger=logger)
-
-    def capture_base64(self) -> str:
-        return self.vision.capture_base64()
-
-    def capture_with_hash(self) -> tuple[str, str]:
-        return self.vision.capture_with_hash()
-
-    def hash_base64(self, image_b64: str) -> str:
-        return self.vision.hash_base64(image_b64)
-
-    def hash_distance(self, hash_a: str | None, hash_b: str | None) -> int:
-        return self.vision.hash_distance(hash_a, hash_b)
-
-    def has_changed(self, previous_b64: str, current_b64: str, threshold: float = 0.01) -> bool:
-        return self.vision.has_changed(previous_b64, current_b64, threshold=threshold)
-
-    def structural_similarity(self, previous_b64: str, current_b64: str) -> float | None:
-        return self.vision.structural_similarity(previous_b64, current_b64)
-
-    def detect_ui_elements(self, image_b64: str) -> list[dict]:
-        return self.vision.detect_ui_elements(image_b64)
-
-    def get_active_window_tree(self, max_depth: int = 5):
-        return self.action_engine.accessibility_driver.get_active_window_tree(max_depth=max_depth)
-
-    def execute(self, action: dict):
-        return self.action_engine.execute(action)
 
 
 def create_computer(settings: Settings) -> ComputerAdapter:

@@ -17,7 +17,7 @@ class HIDDriver(BaseHIDDriver):
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.logger = get_logger(__name__, level=settings.log_level)
-        self.enabled = bool(settings.enable_hid)
+        self.enabled = settings.sends_real_input()
         self.display = get_display_info()
         self.pg = self._import_pyautogui() if self.enabled else None
 

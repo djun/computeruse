@@ -24,10 +24,18 @@ class Settings:
     openrouter_model: str = os.getenv("OPENROUTER_MODEL", "anthropic/claude-opus-4.5")
     planner_api_key: str | None = None
     planner_base_url: str | None = None
-    planner_model: str = os.getenv("PLANNER_MODEL", "anthropic/claude-3.5-sonnet")
+    # Planner/reflector default to the core model (single strong model) when their
+    # env var is blank; set PLANNER_MODEL/REFLECTOR_MODEL to use a distinct model.
+    planner_model: str = os.getenv("PLANNER_MODEL", "")
     reflector_api_key: str | None = None
     reflector_base_url: str | None = None
-    reflector_model: str = os.getenv("REFLECTOR_MODEL", "openai/gpt-5.1")
+    reflector_model: str = os.getenv("REFLECTOR_MODEL", "")
+    # Dedicated grounder (composed-agent pattern: strong planner + cheap grounder).
+    # UI-TARS-1.5-7B via OpenRouter resolves a target description to pixel coordinates.
+    enable_uitars_grounder: bool = _get_bool("ENABLE_UITARS_GROUNDER", False)
+    uitars_model: str = os.getenv("UITARS_MODEL", "bytedance/ui-tars-1.5-7b")
+    uitars_api_key: str | None = None
+    uitars_base_url: str | None = None
     enable_reflection: bool = _get_bool("ENABLE_REFLECTION", True)
     strict_step_completion: bool = _get_bool("STRICT_STEP_COMPLETION", True)
     embedding_api_key: str | None = None
@@ -44,14 +52,27 @@ class Settings:
     max_wall_clock_seconds: int | None = (
         int(os.getenv("MAX_WALL_CLOCK_SECONDS", "0")) or None
     )
+    # Per-task token budget across planner + cognitive core + reflector; 0 = unlimited.
+    max_total_tokens: int | None = (
+        int(os.getenv("MAX_TOTAL_TOKENS", "0")) or None
+    )
     autonomy_level: str = os.getenv("AUTONOMY_LEVEL", "confirm_risky")
     max_recovery_attempts_per_step: int = int(os.getenv("MAX_RECOVERY_ATTEMPTS_PER_STEP", "3"))
     max_replans_per_task: int = int(os.getenv("MAX_REPLANS_PER_TASK", "4"))
     max_same_target_failures: int = int(os.getenv("MAX_SAME_TARGET_FAILURES", "2"))
     force_visual_every_n_turns: int = int(os.getenv("FORCE_VISUAL_EVERY_N_TURNS", "3"))
     min_grounding_confidence: float = float(os.getenv("MIN_GROUNDING_CONFIDENCE", "0.55"))
+    # Grounding: when true (default), send the raw screenshot and ask the model for
+    # native x/y pixel coordinates as the primary targeting method, with the
+    # accessibility tree / Set-of-Mark overlay / OCR nodes as optional fallbacks.
+    # Set false to restore Set-of-Mark-primary (numbered-overlay + element_id) mode.
+    prefer_native_coordinates: bool = _get_bool("PREFER_NATIVE_COORDINATES", True)
 
     enable_hid: bool = _get_bool("ENABLE_HID", False)
+    # Explicit simulation switch: when true, the full loop runs (plan/act/verify)
+    # but no real OS input is ever sent, even if ENABLE_HID=true. Independent of
+    # ENABLE_HID so "run the loop without touching the machine" is a named intent.
+    simulation_mode: bool = _get_bool("SIMULATION_MODE", False)
     enable_semantic: bool = _get_bool("ENABLE_SEMANTIC", True)
     enable_shell: bool = _get_bool("ENABLE_SHELL", False)
     execution_profile: str = os.getenv("EXECUTION_PROFILE", "hybrid")
@@ -94,6 +115,10 @@ class Settings:
     browser_script_timeout_s: float = float(os.getenv("BROWSER_SCRIPT_TIMEOUT_S", "8"))
     browser_navigation_timeout_s: float = float(os.getenv("BROWSER_NAVIGATION_TIMEOUT_S", "12"))
 
+    # Deterministic trajectory recording (opt-in) for debug/replay.
+    enable_trajectory_recording: bool = _get_bool("ENABLE_TRAJECTORY_RECORDING", False)
+    trajectory_path: str = os.getenv("TRAJECTORY_PATH", ".agent_memory/trajectory.jsonl")
+
     # Live observability dashboard
     enable_debug_dashboard: bool = _get_bool("ENABLE_DEBUG_DASHBOARD", False)
     debug_dashboard_host: str = os.getenv("DEBUG_DASHBOARD_HOST", "127.0.0.1")
@@ -133,6 +158,18 @@ class Settings:
         if self.openrouter_base_url is None:
             self.openrouter_base_url = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 
+        # Consolidate on the core model: planner/reflector reuse it unless overridden.
+        if not self.planner_model:
+            self.planner_model = self.openrouter_model
+        if not self.reflector_model:
+            self.reflector_model = self.openrouter_model
+
+        # UI-TARS grounder key/base fall back to the OpenRouter values.
+        if self.uitars_api_key is None:
+            self.uitars_api_key = os.getenv("UITARS_API_KEY") or self.openrouter_api_key
+        if self.uitars_base_url is None:
+            self.uitars_base_url = os.getenv("UITARS_BASE_URL", self.openrouter_base_url)
+
         # Dynamically load Planner settings
         if self.planner_api_key is None:
             self.planner_api_key = os.getenv("PLANNER_API_KEY") or self.openrouter_api_key
@@ -164,6 +201,10 @@ class Settings:
         # Handle embedding_model
         if self.embedding_model is None:
             self.embedding_model = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+
+    def sends_real_input(self) -> bool:
+        """True only when HID is enabled and simulation mode is not forcing dry-run."""
+        return self.enable_hid and not self.simulation_mode
 
     def allows_gui_actions(self) -> bool:
         return self.execution_profile in {"local_gui", "hybrid"}

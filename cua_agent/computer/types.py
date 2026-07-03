@@ -39,6 +39,7 @@ ComputerActionName = Literal[
     "open_app",
     "focus_window",
     "screenshot",
+    "zoom",
     "run_skill",
 ]
 
@@ -69,5 +70,6 @@ COMPUTER_ACTION_SPACE: tuple[ComputerActionName, ...] = (
     "open_app",
     "focus_window",
     "screenshot",
+    "zoom",
     "run_skill",
 )

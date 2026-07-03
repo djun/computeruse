@@ -3,20 +3,17 @@
 from __future__ import annotations
 
 import time
-import json
 import re
-import subprocess
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from cua_agent.agent.cognitive_core import CognitiveCore
-from cua_agent.agent.state_manager import ActionResult, StateManager, VerificationContract
+from cua_agent.agent.state_manager import ActionResult, StateManager
 from cua_agent.computer.adapter import ComputerAdapter
 from cua_agent.grounding.grounder import Grounder
 from cua_agent.memory.memory_manager import Episode, MemoryManager
+from cua_agent.memory.skill_composer import SkillComposer
 from cua_agent.observability import LiveDebugDashboard
 from cua_agent.orchestrator.action_policy import ActionPolicy
-from cua_agent.orchestrator.learning_manager import LearningManager
 from cua_agent.orchestrator.planner_client import PlannerClient
 from cua_agent.orchestrator.planning import Plan, Step
 from cua_agent.orchestrator.react_controller import ReactController
@@ -27,8 +24,6 @@ from cua_agent.utils.config import Settings
 from cua_agent.utils.logger import get_logger
 from cua_agent.utils.ax_pruning import prune_ax_tree_for_prompt
 from cua_agent.utils.ax_utils import draw_som_overlay, flatten_nodes_with_frames
-
-SKILL_PLACEHOLDER_RE = re.compile(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}")
 
 
 class Orchestrator:
@@ -47,13 +42,21 @@ class Orchestrator:
         self.action_policy = ActionPolicy(settings)
         self.react_controller = ReactController(settings)
         self.recovery_manager = RecoveryManager(settings)
-        self.learning_manager = LearningManager()
+        self.skill_composer = SkillComposer(platform_name=computer.platform_name)
+        self.trajectory = None
+        if settings.enable_trajectory_recording:
+            from cua_agent.observability.trajectory import TrajectoryRecorder
+
+            self.trajectory = TrajectoryRecorder(settings.trajectory_path)
         self.dashboard = LiveDebugDashboard(settings, self.logger)
         self.display = computer.display
         self.global_hotkeys = getattr(computer, "global_hotkeys", set())
 
-        if not settings.enable_hid:
-            self.logger.warning("ENABLE_HID is false; actions will run in dry-run mode (no real input).")
+        if not settings.sends_real_input():
+            if settings.simulation_mode:
+                self.logger.warning("SIMULATION_MODE is on; the loop runs but no real input is sent.")
+            else:
+                self.logger.warning("ENABLE_HID is false; actions will run in dry-run mode (no real input).")
 
     def run_task(self, user_prompt: str) -> dict:
         self.computer.run_health_checks(self.settings, logger=self.logger)
@@ -134,16 +137,28 @@ class Orchestrator:
         VISUAL_HASH_STATIC_THRESHOLD = 4  # Hamming distance; increased to ignore noise
         STAGNATION_LIMIT = 5        # consecutive frames with minimal change
         current_tags: List[Dict[str, Any]] = []
+        pending_zoom_frame: str | None = None
         step_trace: List[Dict[str, Any]] = []
         active_step_id = plan.current_step().id if plan and plan.current_step() else None
         force_vision_next_turn = True
+        recovery_pending_replan = False
         low_conf_refresh_streak = 0
 
         try:
             while not state.should_halt():
-                if plan and plan_revision_count < max_plan_revisions and self._should_replan(
+                budget = self.settings.max_total_tokens
+                if budget and self._total_tokens_used() >= budget:
+                    used = self._total_tokens_used()
+                    self.logger.warning("Token budget reached (%s/%s); stopping.", used, budget)
+                    state.history.append(f"token_budget_exceeded:{used}/{budget}")
+                    self.dashboard.push_event(f"token budget exceeded ({used}/{budget}); stopping")
+                    break
+
+                wants_replan = recovery_pending_replan or self._should_replan(
                     plan, state, repeat_same_action, repeat_without_change
-                ):
+                )
+                recovery_pending_replan = False  # consumed this turn to avoid replan loops
+                if plan and plan_revision_count < max_plan_revisions and wants_replan:
                     revised_plan = self.planner.revise_plan(plan, state.history, current_frame)
                     if revised_plan:
                         if revised_plan.to_dict() != plan.to_dict():
@@ -185,7 +200,18 @@ class Orchestrator:
                 current_hash = grounding.frame_hash
                 ax_tree = grounding.ax_tree
                 current_tags = grounding.som_tags
-                overlay_frame = grounding.overlay_b64 if include_visual_context else ""
+                # In native-coordinate mode, send the raw screenshot (no numbered overlay)
+                # and let the model return x/y directly; the SoM overlay is the fallback aid.
+                if not include_visual_context:
+                    overlay_frame = ""
+                elif pending_zoom_frame:
+                    # Show the zoomed region this turn; coordinates stay in original space.
+                    overlay_frame = pending_zoom_frame
+                elif self.settings.prefer_native_coordinates:
+                    overlay_frame = grounding.screenshot_b64
+                else:
+                    overlay_frame = grounding.overlay_b64
+                pending_zoom_frame = None
 
                 loop_state = self._format_loop_state(plan, state, repeat_same_action, repeat_without_change)
                 loop_state["visual_context"] = "image" if include_visual_context else "text_only"
@@ -237,7 +263,7 @@ class Orchestrator:
                     )
                     raw_skill_args = action.get("skill_args")
                     runtime_args = raw_skill_args if isinstance(raw_skill_args, dict) else {}
-                    rendered_actions, resolved_args, missing_params = self._materialize_skill_actions(skill, runtime_args)
+                    rendered_actions, resolved_args, missing_params = self.skill_composer._materialize_skill_actions(skill, runtime_args)
                     if missing_params:
                         result = ActionResult(
                             success=False,
@@ -261,7 +287,7 @@ class Orchestrator:
                         "skill_name": skill.name,
                         "skill_args": resolved_args,
                     }
-                    skill_contract = self._render_skill_verification_contract(skill, resolved_args)
+                    skill_contract = self.skill_composer._render_skill_verification_contract(skill, resolved_args)
                     if requested_contract:
                         action["verification"] = requested_contract
                     elif skill_contract:
@@ -282,8 +308,7 @@ class Orchestrator:
                         "action": repr(action),
                         "hint": policy_decision.reason,
                     }
-                    self.learning_manager.record_turn(
-                        state,
+                    state.record_turn(
                         self.react_controller.finalize_turn(
                             turn,
                             observation_summary=envelope.observation_summary,
@@ -344,6 +369,20 @@ class Orchestrator:
                     crosshair=current_crosshair,
                 )
 
+                # Handle Zoom: re-capture a region at higher detail as an observation.
+                if action.get("type") == "zoom":
+                    result = self.computer.execute(action)
+                    state.record_action(action, result)
+                    if result.success and result.metadata:
+                        pending_zoom_frame = result.metadata.get("zoom_image") or None
+                        region = result.metadata.get("region")
+                        state.history.append(f"zoom_region:{region}")
+                        self.dashboard.push_event(f"zoom region {region}")
+                    else:
+                        state.history.append(f"zoom_failed:{result.reason}")
+                    force_vision_next_turn = True
+                    continue
+
                 # Handle Notebook Operations (Internal State)
                 if action.get("type") == "notebook_op":
                     op_action = action.get("action")
@@ -388,6 +427,10 @@ class Orchestrator:
 
                 result = self.computer.execute(action)
                 state.record_action(action, result)
+                if self.trajectory is not None:
+                    self.trajectory.record(
+                        action, success=result.success, frame_hash=current_hash, reason=result.reason
+                    )
                 if action.get("execution") == "shell" and result.metadata:
                     stdout = (result.metadata.get("stdout") or "").strip()
                     stderr = (result.metadata.get("stderr") or "").strip()
@@ -440,6 +483,12 @@ class Orchestrator:
                     repeat_without_change=repeat_without_change,
                     reason=verification_reason,
                 )
+                # Let the recovery decision drive the loop (not just be logged): it can
+                # request a forced visual refresh and/or a replan on the next turn.
+                if recovery_decision.force_vision_next_turn:
+                    force_vision_next_turn = True
+                if recovery_decision.replan:
+                    recovery_pending_replan = True
                 # Strip heavy payloads (base64 frame, full a11y subtree) from the
                 # turn record. The turn is copied into the event log and fed back
                 # through compact_view into the next prompt; keeping image/tree data
@@ -450,8 +499,7 @@ class Orchestrator:
                     for key, value in verification_outcome.items()
                     if key not in {"next_frame", "ax_tree_after"}
                 }
-                self.learning_manager.record_turn(
-                    state,
+                state.record_turn(
                     self.react_controller.finalize_turn(
                         turn,
                         observation_summary=envelope.observation_summary,
@@ -652,24 +700,18 @@ class Orchestrator:
                     pending_break = True
                     break_reason = "oscillatory_loop"
 
-                if not is_wait and not pending_break:
-                    if action_sig == last_action_sig:
-                        repeat_same_action += 1
-                        if repeat_same_action >= 3:  # Stricter limit (was 5)
-                            pending_break = True
-                            break_reason = f"repeat_same_action:{repeat_same_action}"
-                    else:
-                        repeat_same_action = 0
-                    if not changed and action_sig == last_action_sig:
-                        repeat_without_change += 1
-                        if repeat_without_change >= 2:  # Stricter limit (was 3)
-                            pending_break = True
-                            break_reason = break_reason or "repeat_without_change"
-                    else:
-                        repeat_without_change = 0
-                else:
-                    repeat_same_action = 0
-                    repeat_without_change = 0
+                repeat_same_action, repeat_without_change, pending_break, break_reason = (
+                    self._apply_repeat_stagnation(
+                        is_wait=is_wait,
+                        pending_break=pending_break,
+                        break_reason=break_reason,
+                        action_sig=action_sig,
+                        last_action_sig=last_action_sig,
+                        changed=changed,
+                        repeat_same_action=repeat_same_action,
+                        repeat_without_change=repeat_without_change,
+                    )
+                )
 
                 if not pending_break and low_change_streak >= STAGNATION_LIMIT:
                     pending_break = True
@@ -758,6 +800,54 @@ class Orchestrator:
         self._persist_episode(user_prompt, state, plan)
         return summary
 
+    def _total_tokens_used(self) -> int:
+        """Cumulative tokens across planner + cognitive core + reflector + grounder this run."""
+        action_engine = getattr(getattr(self, "computer", None), "action_engine", None)
+        grounder = getattr(action_engine, "grounding_model", None)
+        return (
+            int(getattr(self.planner, "tokens_used", 0) or 0)
+            + int(getattr(self.cognitive_core, "tokens_used", 0) or 0)
+            + int(getattr(self.reflector, "tokens_used", 0) or 0)
+            + int(getattr(grounder, "tokens_used", 0) or 0)
+        )
+
+    @staticmethod
+    def _apply_repeat_stagnation(
+        *,
+        is_wait: bool,
+        pending_break: bool,
+        break_reason: str,
+        action_sig: str | None,
+        last_action_sig: str | None,
+        changed: bool,
+        repeat_same_action: int,
+        repeat_without_change: int,
+    ) -> tuple[int, int, bool, str]:
+        """Update repeat counters and the break decision from a turn's outcome.
+
+        Pure: no side effects. Extracted from the session loop for testability.
+        Counters reset when the action is a wait or a break is already pending.
+        """
+        if not is_wait and not pending_break:
+            if action_sig == last_action_sig:
+                repeat_same_action += 1
+                if repeat_same_action >= 3:  # Stricter limit (was 5)
+                    pending_break = True
+                    break_reason = f"repeat_same_action:{repeat_same_action}"
+            else:
+                repeat_same_action = 0
+            if not changed and action_sig == last_action_sig:
+                repeat_without_change += 1
+                if repeat_without_change >= 2:  # Stricter limit (was 3)
+                    pending_break = True
+                    break_reason = break_reason or "repeat_without_change"
+            else:
+                repeat_without_change = 0
+        else:
+            repeat_same_action = 0
+            repeat_without_change = 0
+        return repeat_same_action, repeat_without_change, pending_break, break_reason
+
     def _should_replan(
         self, plan: Optional[Plan], state: StateManager, repeat_same_action: int, repeat_without_change: int
     ) -> bool:
@@ -823,7 +913,7 @@ class Orchestrator:
             return {"attempted": False, "success": False}
 
         skill = match.skill
-        fast_actions, resolved_args, missing_params = self._materialize_skill_actions(skill, {})
+        fast_actions, resolved_args, missing_params = self.skill_composer._materialize_skill_actions(skill, {})
         if missing_params:
             self.logger.info(
                 "Fast-path skipped for skill %s due to missing required params: %s",
@@ -843,7 +933,7 @@ class Orchestrator:
             "skill_args": resolved_args,
             "skill_fast_path": True,
         }
-        skill_contract = self._render_skill_verification_contract(skill, resolved_args)
+        skill_contract = self.skill_composer._render_skill_verification_contract(skill, resolved_args)
         if skill_contract:
             action["verification"] = skill_contract
 
@@ -1007,8 +1097,8 @@ class Orchestrator:
     ) -> None:
         if not step_trace:
             return
-        actions = self._extract_recovered_actions(step_trace)
-        actions, parameters = self._build_composable_skill_payload(actions)
+        actions = self.skill_composer._extract_recovered_actions(step_trace)
+        actions, parameters = self.skill_composer._build_composable_skill_payload(actions)
         min_actions = max(1, int(self.settings.dynamic_skill_min_actions))
         if len(actions) < min_actions:
             return
@@ -1019,7 +1109,7 @@ class Orchestrator:
 
         try:
             name_seed = (current_step.description if current_step else "") or user_prompt or "task"
-            name = (self._slugify(name_seed)[:40] + "-auto") if name_seed else f"macro-auto-{int(time.time())}"
+            name = (self.skill_composer._slugify(name_seed)[:40] + "-auto") if name_seed else f"macro-auto-{int(time.time())}"
             description = ""
             if current_step:
                 description = current_step.success_criteria or current_step.description or ""
@@ -1032,8 +1122,8 @@ class Orchestrator:
                 tags.append("self_healed")
             if current_step and current_step.id:
                 tags.append(f"step:{current_step.id}")
-            verification_contract = self._derive_skill_verification_contract(current_step)
-            preconditions, grounding_signature = self._skill_context_metadata(actions)
+            verification_contract = self.skill_composer._derive_skill_verification_contract(current_step)
+            preconditions, grounding_signature = self.skill_composer._skill_context_metadata(actions)
             self.memory.save_skill(
                 name=name,
                 description=description,
@@ -1055,300 +1145,16 @@ class Orchestrator:
         except Exception as exc:  # pragma: no cover - defensive
             self.logger.warning("Failed to synthesize dynamic skill: %s", exc)
 
-    def _extract_recovered_actions(self, step_trace: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        last_failure_idx = -1
-        for idx, event in enumerate(step_trace):
-            if not event.get("success", True):
-                last_failure_idx = idx
-        candidate_window = step_trace[last_failure_idx + 1 :] if step_trace else []
 
-        extracted: List[Dict[str, Any]] = []
-        for event in candidate_window:
-            if not event.get("success", True):
-                continue
-            raw_action = event.get("action") or {}
-            if raw_action.get("type") == "macro_actions":
-                for sub in raw_action.get("actions") or []:
-                    cleaned_sub = self._sanitize_action_for_skill(sub)
-                    if cleaned_sub:
-                        extracted.append(cleaned_sub)
-                continue
-            cleaned = self._sanitize_action_for_skill(raw_action)
-            if cleaned:
-                extracted.append(cleaned)
 
-        deduped: List[Dict[str, Any]] = []
-        for act in extracted:
-            if deduped and act == deduped[-1]:
-                continue
-            deduped.append(act)
-        return deduped
 
-    def _sanitize_action_for_skill(self, action: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        allowed_types = {
-            "left_click",
-            "right_click",
-            "double_click",
-            "click_element",
-            "mouse_move",
-            "hover",
-            "drag_and_drop",
-            "select_area",
-            "scroll",
-            "scroll_to_element",
-            "type",
-            "fill_field",
-            "click_and_type",
-            "key",
-            "open_app",
-            "focus_window",
-            "wait",
-            "wait_for_element",
-            "wait_for_idle",
-        }
-        action_type = action.get("type")
-        if action_type not in allowed_types:
-            return None
 
-        keep_keys = {
-            "type",
-            "x",
-            "y",
-            "target_x",
-            "target_y",
-            "scroll_y",
-            "clicks",
-            "axis",
-            "text",
-            "keys",
-            "seconds",
-            "duration",
-            "hold_delay",
-            "app_name",
-            "phantom_mode",
-            "semantic_role",
-            "semantic_label",
-            "semantic_path",
-            "role",
-            "label",
-            "path",
-            "element_ref",
-            "window_title",
-            "submit",
-            "clear",
-            "timeout",
-            "max_scrolls",
-            "paste",
-            "capture_selection",
-            "click_type",
-        }
-        cleaned: Dict[str, Any] = {}
-        for key in keep_keys:
-            if key in action and action.get(key) is not None:
-                cleaned[key] = action.get(key)
-        if cleaned.get("type") == "scroll" and "clicks" not in cleaned:
-            if action.get("scroll_y") is not None:
-                cleaned["clicks"] = int(action.get("scroll_y"))
-            else:
-                cleaned["clicks"] = 0
-        if "type" not in cleaned:
-            cleaned["type"] = action_type
-        return cleaned
 
-    def _materialize_skill_actions(
-        self,
-        skill: Any,
-        runtime_args: Dict[str, Any],
-    ) -> tuple[List[Dict[str, Any]], Dict[str, Any], List[str]]:
-        parameters = skill.parameters if isinstance(getattr(skill, "parameters", None), dict) else {}
-        resolved_args: Dict[str, Any] = {}
 
-        for key, value in (runtime_args or {}).items():
-            if self._is_skill_arg_scalar(value):
-                resolved_args[str(key)] = value
 
-        missing: List[str] = []
-        for param_name, spec in parameters.items():
-            token = str(param_name)
-            if token in resolved_args and resolved_args[token] not in (None, ""):
-                continue
 
-            default_value = self._skill_param_default(spec)
-            if default_value is not None:
-                resolved_args[token] = default_value
-                continue
 
-            if self._skill_param_required(spec):
-                missing.append(token)
 
-        rendered = self._render_template_value(skill.actions, resolved_args)
-        if not isinstance(rendered, list):
-            return [], resolved_args, sorted(set(missing))
-
-        rendered_actions = [dict(item) for item in rendered if isinstance(item, dict)]
-        unresolved = self._extract_template_placeholders(rendered_actions)
-        unresolved_missing = sorted(name for name in unresolved if name not in resolved_args)
-        if unresolved_missing:
-            missing.extend(unresolved_missing)
-
-        return rendered_actions, resolved_args, sorted(set(missing))
-
-    def _render_skill_verification_contract(
-        self,
-        skill: Any,
-        resolved_args: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        raw_contract = (
-            skill.verification_contract
-            if isinstance(getattr(skill, "verification_contract", None), dict)
-            else {}
-        )
-        if not raw_contract:
-            return {}
-        rendered = self._render_template_value(raw_contract, resolved_args)
-        if not isinstance(rendered, dict):
-            return {}
-        contract: Dict[str, Any] = {}
-        if rendered.get("sensor") is not None:
-            contract["sensor"] = str(rendered.get("sensor")).strip().lower()
-        if rendered.get("expected_state") is not None:
-            expected = str(rendered.get("expected_state")).strip()
-            if expected:
-                contract["expected_state"] = expected[:500]
-        if rendered.get("timeout_seconds") is not None:
-            try:
-                timeout = int(rendered.get("timeout_seconds"))
-                contract["timeout_seconds"] = max(1, min(timeout, 30))
-            except (TypeError, ValueError):
-                pass
-        return contract
-
-    def _build_composable_skill_payload(
-        self,
-        actions: List[Dict[str, Any]],
-    ) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
-        templated_actions = [dict(action) for action in actions if isinstance(action, dict)]
-        parameters: Dict[str, Any] = {}
-        counters: Dict[str, int] = {}
-        param_fields = ("text", "content", "app_name", "url", "value")
-
-        for action in templated_actions:
-            for field in param_fields:
-                raw_value = action.get(field)
-                if not isinstance(raw_value, str):
-                    continue
-                value = raw_value.strip()
-                if not value:
-                    continue
-                # Keep explicit templates intact.
-                if SKILL_PLACEHOLDER_RE.search(value):
-                    continue
-                if not any(char.isalnum() for char in value):
-                    continue
-
-                counters[field] = counters.get(field, 0) + 1
-                param_name = f"{field}_{counters[field]}"
-                action[field] = "{" + param_name + "}"
-                parameters[param_name] = {
-                    "description": f"Runtime value for '{field}' in the skill action sequence.",
-                    "required": False,
-                    "default": raw_value,
-                }
-
-        return templated_actions, parameters
-
-    def _derive_skill_verification_contract(
-        self,
-        current_step: Optional[Step],
-        source_action: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        source_contract = (
-            source_action.get("verification")
-            if isinstance(source_action, dict) and isinstance(source_action.get("verification"), dict)
-            else {}
-        )
-        if source_contract:
-            contract: Dict[str, Any] = {}
-            if source_contract.get("sensor") is not None:
-                contract["sensor"] = str(source_contract.get("sensor")).strip().lower()
-            if source_contract.get("expected_state") is not None:
-                expected = str(source_contract.get("expected_state")).strip()
-                if expected:
-                    contract["expected_state"] = expected[:500]
-            if source_contract.get("timeout_seconds") is not None:
-                try:
-                    timeout = int(source_contract.get("timeout_seconds"))
-                    contract["timeout_seconds"] = max(1, min(timeout, 30))
-                except (TypeError, ValueError):
-                    pass
-            if contract:
-                return contract
-
-        if current_step and getattr(current_step, "expected_state", ""):
-            expected = str(current_step.expected_state).strip()
-            if expected:
-                return {
-                    "sensor": "a11y_tree",
-                    "expected_state": expected[:500],
-                    "timeout_seconds": 5,
-                }
-        return {}
-
-    def _render_template_value(self, value: Any, args: Dict[str, Any]) -> Any:
-        if isinstance(value, dict):
-            return {key: self._render_template_value(val, args) for key, val in value.items()}
-        if isinstance(value, list):
-            return [self._render_template_value(item, args) for item in value]
-        if not isinstance(value, str):
-            return value
-
-        exact = SKILL_PLACEHOLDER_RE.fullmatch(value.strip())
-        if exact:
-            token = exact.group(1)
-            if token in args:
-                return args[token]
-
-        def _replace(match: re.Match[str]) -> str:
-            token = match.group(1)
-            replacement = args.get(token)
-            if replacement is None:
-                return match.group(0)
-            return str(replacement)
-
-        return SKILL_PLACEHOLDER_RE.sub(_replace, value)
-
-    def _extract_template_placeholders(self, value: Any) -> set[str]:
-        found: set[str] = set()
-        if isinstance(value, dict):
-            for child in value.values():
-                found.update(self._extract_template_placeholders(child))
-            return found
-        if isinstance(value, list):
-            for child in value:
-                found.update(self._extract_template_placeholders(child))
-            return found
-        if isinstance(value, str):
-            for match in SKILL_PLACEHOLDER_RE.finditer(value):
-                found.add(match.group(1))
-        return found
-
-    def _skill_param_default(self, spec: Any) -> Any:
-        if isinstance(spec, dict):
-            default = spec.get("default")
-            if self._is_skill_arg_scalar(default):
-                return default
-            return None
-        if isinstance(spec, (int, float, bool)):
-            return spec
-        return None
-
-    def _skill_param_required(self, spec: Any) -> bool:
-        if isinstance(spec, dict):
-            return bool(spec.get("required", False))
-        return False
-
-    def _is_skill_arg_scalar(self, value: Any) -> bool:
-        return isinstance(value, (str, int, float, bool))
 
     def _run_recovery(self, failure_type: str) -> None:
         """Quick, deterministic recovery steps for common failure types."""
@@ -1366,609 +1172,6 @@ class Orchestrator:
             self.computer.execute(
                 {"type": "left_click", "x": width * 0.05, "y": height * 0.95, "phantom_mode": False}
             )
-
-    def _resolve_verification_contract(
-        self,
-        state: StateManager,
-        action: Dict[str, Any],
-        current_step: Optional[Step],
-    ) -> VerificationContract:
-        fallback_expected = None
-        if current_step and getattr(current_step, "expected_state", ""):
-            fallback_expected = str(current_step.expected_state).strip() or None
-        if fallback_expected is None:
-            fallback_expected = self._default_expected_state_for_action(action)
-        return state.normalize_verification_contract(
-            action.get("verification") if isinstance(action.get("verification"), dict) else None,
-            fallback_sensor=self._default_sensor_for_action(action),
-            fallback_expected_state=fallback_expected,
-            verify_after=action.get("verify_after"),
-        )
-
-    def _default_sensor_for_action(self, action: Dict[str, Any]) -> str:
-        action_type = str(action.get("type") or "").strip().lower()
-        if action_type in {
-            "wait",
-            "wait_for_element",
-            "wait_for_idle",
-            "capture_only",
-            "noop",
-            "inspect_ui",
-            "probe_ui",
-            "notebook_op",
-            "mouse_move",
-            "hover",
-            "scroll",
-            "scroll_to_element",
-        }:
-            return "none"
-        if action_type in {"sandbox_shell", "script_op"}:
-            # Shell/script actions often have no reliable UI/telemetry delta; default to no-op verification
-            # unless the action explicitly provides a stronger contract.
-            return "none"
-        if action_type == "clipboard_op":
-            sub_action = str(action.get("sub_action") or "").strip().lower()
-            # Clipboard reads already return direct tool success/failure; generic state-change
-            # verification is often inconclusive and causes false failures.
-            if sub_action == "read":
-                return "none"
-            return "os_telemetry"
-        if action_type in {"open_app", "focus_window"}:
-            return "os_telemetry"
-        if action_type in {"browser_op"}:
-            return "pixel_diff"
-        return "a11y_tree"
-
-    def _default_expected_state_for_action(self, action: Dict[str, Any]) -> str | None:
-        action_type = str(action.get("type") or "").strip().lower()
-        if action_type != "clipboard_op":
-            return None
-
-        sub_action = str(action.get("sub_action") or "").strip().lower()
-        if sub_action == "write":
-            content = str(action.get("content") or "")
-            if not content:
-                return "clipboard_equals:"
-            if len(content) > 220:
-                return f"clipboard_contains:{content[:220]}"
-            return f"clipboard_equals:{content}"
-        if sub_action == "clear":
-            return "clipboard_equals:"
-        return None
-
-    def _collect_os_telemetry_snapshot(self, contract: VerificationContract) -> Dict[str, Any]:
-        if contract.sensor != "os_telemetry":
-            return {}
-        snapshot: Dict[str, Any] = {}
-        clipboard = self._read_clipboard_snapshot()
-        if clipboard is not None:
-            snapshot["clipboard"] = clipboard
-        return snapshot
-
-    def _read_clipboard_snapshot(self) -> str | None:
-        try:
-            res = self.computer.execute({"type": "clipboard_op", "sub_action": "read"})
-        except Exception:
-            return None
-        if not getattr(res, "success", False):
-            return None
-        metadata = getattr(res, "metadata", {}) or {}
-        value = metadata.get("content")
-        if value is None:
-            return ""
-        return str(value)
-
-    def _run_verification_contract(
-        self,
-        action: Dict[str, Any],
-        contract: VerificationContract,
-        current_frame: str,
-        current_hash: str | None,
-        ax_tree_before: Dict[str, Any] | None,
-        telemetry_before: Dict[str, Any],
-        global_hotkeys: set[tuple[str, ...]],
-        phash_static_threshold: int,
-    ) -> Dict[str, Any]:
-        sensor = contract.sensor
-
-        if sensor == "none":
-            next_frame, next_hash = self.computer.capture_with_hash()
-            hash_distance = self.computer.hash_distance(current_hash, next_hash)
-            return {
-                "passed": True,
-                "reason": "verification bypassed by contract",
-                "sensor": sensor,
-                "changed": True,
-                "next_frame": next_frame,
-                "next_hash": next_hash,
-                "hash_distance": hash_distance,
-                "ssim_score": None,
-                "ax_tree_after": None,
-                "ax_changed": False,
-                "note": "verification:none",
-                "force_vision_next_turn": False,
-            }
-
-        if sensor == "os_telemetry":
-            passed, reason = self._verify_os_telemetry(contract, telemetry_before)
-            if passed:
-                next_frame, next_hash = self.computer.capture_with_hash()
-                hash_distance = self.computer.hash_distance(current_hash, next_hash)
-                return {
-                    "passed": True,
-                    "reason": reason,
-                    "sensor": sensor,
-                    "changed": True,
-                    "next_frame": next_frame,
-                    "next_hash": next_hash,
-                    "hash_distance": hash_distance,
-                    "ssim_score": None,
-                    "ax_tree_after": None,
-                    "ax_changed": False,
-                    "note": f"verification:{sensor}:ok",
-                    "force_vision_next_turn": False,
-                }
-
-            visual = self._run_visual_verification(
-                action=action,
-                current_frame=current_frame,
-                current_hash=current_hash,
-                ax_tree_before=ax_tree_before,
-                global_hotkeys=global_hotkeys,
-                phash_static_threshold=phash_static_threshold,
-            )
-            if self._is_os_telemetry_inconclusive_reason(reason):
-                visual_changed = bool(visual.get("changed"))
-                visual["passed"] = visual_changed
-                visual["reason"] = (
-                    f"{reason}; visual fallback detected change"
-                    if visual_changed
-                    else f"{reason}; visual fallback found no change"
-                )
-                visual["note"] = f"verification:{sensor}:fallback"
-            else:
-                visual["passed"] = False
-                visual["reason"] = reason
-                visual["note"] = f"verification:{sensor}:timeout"
-            visual["sensor"] = sensor
-            visual["force_vision_next_turn"] = True
-            return visual
-
-        if sensor == "a11y_tree":
-            passed, reason, ax_tree_after = self._verify_a11y_tree(contract, ax_tree_before)
-            if passed:
-                next_frame, next_hash = self.computer.capture_with_hash()
-                hash_distance = self.computer.hash_distance(current_hash, next_hash)
-                ax_changed = self._ax_changed(ax_tree_before, ax_tree_after) if ax_tree_after else False
-                return {
-                    "passed": True,
-                    "reason": reason,
-                    "sensor": sensor,
-                    "changed": True,
-                    "next_frame": next_frame,
-                    "next_hash": next_hash,
-                    "hash_distance": hash_distance,
-                    "ssim_score": None,
-                    "ax_tree_after": ax_tree_after,
-                    "ax_changed": ax_changed,
-                    "note": f"verification:{sensor}:ok",
-                    "force_vision_next_turn": False,
-                }
-
-            visual = self._run_visual_verification(
-                action=action,
-                current_frame=current_frame,
-                current_hash=current_hash,
-                ax_tree_before=ax_tree_before,
-                global_hotkeys=global_hotkeys,
-                phash_static_threshold=phash_static_threshold,
-            )
-            if self._is_a11y_unavailable_reason(reason):
-                visual_changed = bool(visual.get("changed"))
-                visual["passed"] = visual_changed
-                visual["reason"] = (
-                    f"{reason}; visual fallback detected change"
-                    if visual_changed
-                    else f"{reason}; visual fallback found no change"
-                )
-                visual["note"] = f"verification:{sensor}:fallback"
-            else:
-                visual["passed"] = False
-                visual["reason"] = reason
-                visual["note"] = f"verification:{sensor}:timeout"
-            visual["sensor"] = sensor
-            visual["force_vision_next_turn"] = True
-            return visual
-
-        if sensor == "pixel_diff":
-            passed, reason, frame_after = self._verify_pixel_diff(contract, current_frame)
-            if passed:
-                next_frame = frame_after
-                next_hash = self.computer.hash_base64(next_frame)
-                hash_distance = self.computer.hash_distance(current_hash, next_hash)
-                return {
-                    "passed": True,
-                    "reason": reason,
-                    "sensor": sensor,
-                    "changed": True,
-                    "next_frame": next_frame,
-                    "next_hash": next_hash,
-                    "hash_distance": hash_distance,
-                    "ssim_score": None,
-                    "ax_tree_after": None,
-                    "ax_changed": False,
-                    "note": f"verification:{sensor}:ok",
-                    "force_vision_next_turn": False,
-                }
-
-            visual = self._run_visual_verification(
-                action=action,
-                current_frame=current_frame,
-                current_hash=current_hash,
-                ax_tree_before=ax_tree_before,
-                global_hotkeys=global_hotkeys,
-                phash_static_threshold=phash_static_threshold,
-            )
-            visual["passed"] = False
-            visual["reason"] = reason
-            visual["sensor"] = sensor
-            visual["note"] = f"verification:{sensor}:timeout"
-            visual["force_vision_next_turn"] = True
-            return visual
-
-        visual = self._run_visual_verification(
-            action=action,
-            current_frame=current_frame,
-            current_hash=current_hash,
-            ax_tree_before=ax_tree_before,
-            global_hotkeys=global_hotkeys,
-            phash_static_threshold=phash_static_threshold,
-        )
-        visual["note"] = f"verification:{sensor}"
-        if contract.expected_state:
-            expected_key, _ = self._parse_expected_state(contract.expected_state)
-            if expected_key in {"any", "state_change", "changed"}:
-                visual_changed = bool(visual.get("changed"))
-                visual["passed"] = visual_changed
-                visual["reason"] = "vision_full detected change" if visual_changed else "vision_full found no change"
-            else:
-                matched, expected_reason = self._evaluate_a11y_state(contract.expected_state, ax_tree_before, visual.get("ax_tree_after"))
-                if matched:
-                    visual["passed"] = True
-                    visual["reason"] = expected_reason
-                elif self._is_a11y_unavailable_reason(expected_reason):
-                    visual_changed = bool(visual.get("changed"))
-                    visual["passed"] = visual_changed
-                    visual["reason"] = (
-                        f"{expected_reason}; visual fallback detected change"
-                        if visual_changed
-                        else f"{expected_reason}; visual fallback found no change"
-                    )
-                    visual["note"] = f"verification:{sensor}:fallback"
-                else:
-                    visual["passed"] = False
-                    visual["reason"] = expected_reason
-        else:
-            visual["passed"] = bool(visual.get("changed"))
-            visual["reason"] = "vision_full detected change" if visual.get("changed") else "vision_full found no change"
-        visual["sensor"] = sensor
-        visual["force_vision_next_turn"] = True
-        return visual
-
-    def _run_visual_verification(
-        self,
-        action: Dict[str, Any],
-        current_frame: str,
-        current_hash: str | None,
-        ax_tree_before: Dict[str, Any] | None,
-        global_hotkeys: set[tuple[str, ...]],
-        phash_static_threshold: int,
-    ) -> Dict[str, Any]:
-        verify_after = bool(action.get("verify_after", True))
-        is_interactive = action.get("type") not in {"wait", "capture_only", "noop"}
-
-        extra_delay = 0.0
-        if verify_after and action.get("type") == "key":
-            combo = tuple(sorted([str(k).lower() for k in action.get("keys") or []]))
-            if combo in global_hotkeys:
-                extra_delay = 0.5
-
-        if verify_after and is_interactive:
-            time.sleep(0.2 + extra_delay)
-            stabilize_timeout = max(2.0, self.settings.settle_delay_ms / 1000.0)
-            start_time = time.time()
-            last_poll_frame = self.computer.capture_base64()
-            stable_frames = 0
-            while (time.time() - start_time) < stabilize_timeout:
-                time.sleep(0.15)
-                current_poll_frame = self.computer.capture_base64()
-                if not self.computer.has_changed(last_poll_frame, current_poll_frame, threshold=0.002):
-                    stable_frames += 1
-                else:
-                    stable_frames = 0
-                last_poll_frame = current_poll_frame
-                if stable_frames >= 2:
-                    break
-            next_frame = last_poll_frame
-            next_hash = self.computer.hash_base64(next_frame)
-        else:
-            next_frame, next_hash = self.computer.capture_with_hash()
-
-        hash_distance = self.computer.hash_distance(current_hash, next_hash)
-        ssim_score = None
-        ax_tree_after = None
-        ax_changed = False
-
-        if verify_after:
-            ssim_score = self.computer.structural_similarity(current_frame, next_frame)
-            if self.settings.enable_semantic:
-                ax_after_res = self.computer.get_active_window_tree(max_depth=4)
-                if ax_after_res.success:
-                    ax_tree_after = ax_after_res.metadata.get("tree")
-                    ax_changed = self._ax_changed(ax_tree_before, ax_tree_after)
-            changed = self._compute_changed(
-                current_frame,
-                next_frame,
-                hash_distance,
-                ssim_score,
-                ax_changed,
-                phash_static_threshold=phash_static_threshold,
-            )
-            note = "verification:visual"
-        else:
-            changed = True
-            note = "verify_skipped"
-
-        return {
-            "passed": bool(changed),
-            "reason": "visual changed" if changed else "visual unchanged",
-            "sensor": "vision_full",
-            "changed": changed,
-            "next_frame": next_frame,
-            "next_hash": next_hash,
-            "hash_distance": hash_distance,
-            "ssim_score": ssim_score,
-            "ax_tree_after": ax_tree_after,
-            "ax_changed": ax_changed,
-            "note": note,
-            "force_vision_next_turn": True,
-        }
-
-    def _verify_os_telemetry(self, contract: VerificationContract, before_snapshot: Dict[str, Any]) -> tuple[bool, str]:
-        deadline = time.time() + max(1, int(contract.timeout_seconds))
-        last_reason = "telemetry condition unmet"
-        while time.time() <= deadline:
-            now_snapshot = self._collect_os_telemetry_snapshot(contract)
-            ok, reason = self._evaluate_os_telemetry_state(contract.expected_state, before_snapshot, now_snapshot)
-            if ok:
-                return True, reason
-            last_reason = reason
-            if self._is_os_telemetry_inconclusive_reason(reason):
-                return False, reason
-            time.sleep(0.25)
-        return False, last_reason
-
-    def _has_non_clipboard_os_signal(
-        self,
-        before_snapshot: Dict[str, Any],
-        after_snapshot: Dict[str, Any],
-    ) -> bool:
-        keys = set(before_snapshot.keys()) | set(after_snapshot.keys())
-        return any(str(key).strip().lower() != "clipboard" for key in keys)
-
-    def _has_non_clipboard_os_delta(
-        self,
-        before_snapshot: Dict[str, Any],
-        after_snapshot: Dict[str, Any],
-    ) -> bool:
-        keys = set(before_snapshot.keys()) | set(after_snapshot.keys())
-        for key in keys:
-            if str(key).strip().lower() == "clipboard":
-                continue
-            if before_snapshot.get(key) != after_snapshot.get(key):
-                return True
-        return False
-
-    def _is_os_telemetry_inconclusive_reason(self, reason: str) -> bool:
-        token = str(reason or "").strip().lower()
-        return token.startswith("os telemetry inconclusive")
-
-    def _verify_a11y_tree(
-        self,
-        contract: VerificationContract,
-        before_tree: Dict[str, Any] | None,
-    ) -> tuple[bool, str, Dict[str, Any] | None]:
-        deadline = time.time() + max(1, int(contract.timeout_seconds))
-        last_reason = "a11y condition unmet"
-        last_tree: Dict[str, Any] | None = None
-
-        while time.time() <= deadline:
-            ax_res = self.computer.get_active_window_tree(max_depth=4)
-            if ax_res.success:
-                last_tree = ax_res.metadata.get("tree")
-                ok, reason = self._evaluate_a11y_state(contract.expected_state, before_tree, last_tree)
-                if ok:
-                    return True, reason, last_tree
-                last_reason = reason
-            else:
-                last_reason = ax_res.reason or "a11y capture failed"
-            time.sleep(0.35)
-
-        return False, last_reason, last_tree
-
-    def _is_a11y_unavailable_reason(self, reason: str) -> bool:
-        token = str(reason or "").strip().lower()
-        if not token:
-            return True
-        unavailable_markers = (
-            "unavailable",
-            "capture failed",
-            "permission denied",
-            "missing accessibility permission",
-            "missing accessibility permissions",
-            "accessibility permission",
-            "accessibility permissions",
-            "ax permission",
-            "ax permissions",
-            "ax api disabled",
-            "kaxerrorapidisabled",
-            "not trusted for accessibility",
-            "not authorized for accessibility",
-            "not supported",
-            "blocked",
-            "denied",
-        )
-        return any(marker in token for marker in unavailable_markers)
-
-    def _verify_pixel_diff(
-        self,
-        contract: VerificationContract,
-        base_frame: str,
-    ) -> tuple[bool, str, str]:
-        key, value = self._parse_expected_state(contract.expected_state)
-        threshold = 0.01
-        if key in {"pixel_change_gt", "pixel_diff_gt", "change_gt"} and value:
-            try:
-                threshold = max(0.0005, min(float(value), 0.2))
-            except ValueError:
-                threshold = 0.01
-        if key in {"pixel_change_pct_gt"} and value:
-            try:
-                threshold = max(0.0005, min(float(value) / 100.0, 0.2))
-            except ValueError:
-                threshold = 0.01
-
-        deadline = time.time() + max(1, int(contract.timeout_seconds))
-        last_frame = base_frame
-        while time.time() <= deadline:
-            frame = self.computer.capture_base64()
-            last_frame = frame
-            if self.computer.has_changed(base_frame, frame, threshold=threshold):
-                return True, f"pixel delta exceeded threshold={threshold:.4f}", frame
-            time.sleep(0.2)
-        return False, f"pixel delta stayed below threshold={threshold:.4f}", last_frame
-
-    def _parse_expected_state(self, expected_state: Optional[str]) -> tuple[str, str]:
-        raw = str(expected_state or "").strip()
-        if not raw:
-            return "any", ""
-        if ":" in raw:
-            key, value = raw.split(":", 1)
-            return key.strip().lower(), value.strip()
-        return raw.strip().lower(), ""
-
-    def _evaluate_os_telemetry_state(
-        self,
-        expected_state: Optional[str],
-        before_snapshot: Dict[str, Any],
-        after_snapshot: Dict[str, Any],
-    ) -> tuple[bool, str]:
-        key, value = self._parse_expected_state(expected_state)
-        clipboard_before = str(before_snapshot.get("clipboard") or "")
-        clipboard_after = str(after_snapshot.get("clipboard") or "")
-        value_l = value.lower()
-
-        if key in {"any", "state_change", "changed"}:
-            changed = before_snapshot != after_snapshot
-            if changed:
-                if not self._has_non_clipboard_os_signal(before_snapshot, after_snapshot):
-                    return False, "os telemetry inconclusive (no non-clipboard signal)"
-                if not self._has_non_clipboard_os_delta(before_snapshot, after_snapshot):
-                    return False, "os telemetry inconclusive (clipboard-only change)"
-                return True, "os telemetry changed"
-            if key in {"state_change", "changed"}:
-                return False, "os telemetry unchanged"
-            if not self._has_non_clipboard_os_signal(before_snapshot, after_snapshot):
-                return False, "os telemetry inconclusive (no non-clipboard signal)"
-            return False, "os telemetry unchanged"
-        if key == "clipboard_changed":
-            changed = clipboard_before != clipboard_after
-            return changed, "clipboard changed" if changed else "clipboard unchanged"
-        if key == "clipboard_contains":
-            matched = value_l in clipboard_after.lower()
-            return matched, "clipboard contains expected text" if matched else "clipboard missing expected text"
-        if key == "clipboard_equals":
-            matched = clipboard_after == value
-            return matched, "clipboard equals expected text" if matched else "clipboard value mismatch"
-        if key == "file_exists":
-            exists = Path(value).expanduser().exists() if value else False
-            return exists, "file exists" if exists else "file not found"
-        if key in {"file_not_exists", "file_missing"}:
-            missing = not Path(value).expanduser().exists() if value else True
-            return missing, "file absent" if missing else "file still exists"
-        if key in {"process_exists", "app_open"}:
-            running = self._process_exists(value)
-            return running, "process found" if running else "process not found"
-        if key == "process_not_exists":
-            stopped = not self._process_exists(value)
-            return stopped, "process absent" if stopped else "process still running"
-        if key == "app_focused":
-            focused = self._process_exists(value) or (value_l in json.dumps(after_snapshot, ensure_ascii=False).lower())
-            return focused, "app appears focused/open" if focused else "app focus not detected"
-
-        if not self._has_non_clipboard_os_signal(before_snapshot, after_snapshot):
-            return False, "os telemetry inconclusive (no non-clipboard signal)"
-        blob = json.dumps(after_snapshot, ensure_ascii=False).lower()
-        matched = key in blob if value == "" else value_l in blob
-        return matched, "telemetry token found" if matched else "telemetry token missing"
-
-    def _evaluate_a11y_state(
-        self,
-        expected_state: Optional[str],
-        before_tree: Dict[str, Any] | None,
-        after_tree: Dict[str, Any] | None,
-    ) -> tuple[bool, str]:
-        if after_tree is None:
-            return False, "a11y tree unavailable"
-
-        key, value = self._parse_expected_state(expected_state)
-        payload = json.dumps(after_tree, ensure_ascii=False).lower()
-        value_l = value.lower()
-
-        if key in {"any", "state_change", "changed"}:
-            if before_tree is None:
-                return True, "a11y tree captured"
-            changed = self._ax_changed(before_tree, after_tree)
-            return changed, "a11y tree changed" if changed else "a11y tree unchanged"
-        if key in {"text_exists", "contains", "title_contains", "url_contains"}:
-            matched = value_l in payload
-            return matched, "a11y text found" if matched else "a11y text not found"
-        if key in {"text_not_exists", "not_contains"}:
-            matched = value_l not in payload
-            return matched, "a11y text absent" if matched else "a11y text still present"
-        if key == "role_exists":
-            matched = f"\"role\": \"{value_l}\"" in payload or f"\"role\":\"{value_l}\"" in payload
-            return matched, "a11y role found" if matched else "a11y role not found"
-
-        token = key if value == "" else value_l
-        matched = token in payload
-        return matched, "a11y token found" if matched else "a11y token missing"
-
-    def _process_exists(self, name: str) -> bool:
-        query = str(name or "").strip().lower()
-        if not query:
-            return False
-        try:
-            if self.computer.platform_name.lower().startswith("windows"):
-                completed = subprocess.run(
-                    ["tasklist", "/fo", "csv", "/nh"],
-                    capture_output=True,
-                    text=True,
-                    timeout=2,
-                    check=False,
-                )
-            else:
-                completed = subprocess.run(
-                    ["ps", "-A", "-o", "comm="],
-                    capture_output=True,
-                    text=True,
-                    timeout=2,
-                    check=False,
-                )
-        except Exception:
-            return False
-        haystack = (completed.stdout or "").lower()
-        return query in haystack
 
     def _format_loop_state(
         self, plan: Optional[Plan], state: StateManager, repeat_same_action: int, repeat_without_change: int
@@ -2180,37 +1383,6 @@ class Orchestrator:
 
         return False
 
-    def _compute_changed(
-        self,
-        prev_frame: str,
-        next_frame: str,
-        hash_distance: int,
-        ssim_score: float | None,
-        ax_changed: bool,
-        phash_static_threshold: int,
-    ) -> bool:
-        """Blend visual hash, SSIM-like score, and accessibility diffs to reduce false stagnation."""
-        if ax_changed:
-            return True
-
-        if ssim_score is not None and ssim_score < self.settings.ssim_change_threshold:
-            return True
-
-        if hash_distance > phash_static_threshold:
-            return True
-
-        return self.computer.has_changed(prev_frame, next_frame)
-
-    def _ax_changed(self, before: dict | None, after: dict | None) -> bool:
-        if before is None or after is None:
-            return False
-        try:
-            before_str = json.dumps(before, sort_keys=True)
-            after_str = json.dumps(after, sort_keys=True)
-            return before_str != after_str
-        except Exception:
-            return False
-
     def _maybe_save_skill(
         self,
         action: dict,
@@ -2228,7 +1400,7 @@ class Orchestrator:
                 name_seed = current_step.description
             elif user_prompt:
                 name_seed = user_prompt
-            name = self._slugify(name_seed)[:50] or f"macro-{int(time.time())}"
+            name = self.skill_composer._slugify(name_seed)[:50] or f"macro-{int(time.time())}"
             description = ""
             if current_step:
                 description = current_step.success_criteria or current_step.description or ""
@@ -2238,9 +1410,9 @@ class Orchestrator:
             if current_step and current_step.id:
                 tags.append(f"step:{current_step.id}")
             raw_actions = [dict(a) for a in action.get("actions") or []]
-            composable_actions, parameters = self._build_composable_skill_payload(raw_actions)
-            verification_contract = self._derive_skill_verification_contract(current_step, source_action=action)
-            preconditions, grounding_signature = self._skill_context_metadata(composable_actions)
+            composable_actions, parameters = self.skill_composer._build_composable_skill_payload(raw_actions)
+            verification_contract = self.skill_composer._derive_skill_verification_contract(current_step, source_action=action)
+            preconditions, grounding_signature = self.skill_composer._skill_context_metadata(composable_actions)
             self.memory.save_skill(
                 name=name,
                 description=description,
@@ -2256,38 +1428,7 @@ class Orchestrator:
         except Exception as exc:  # pragma: no cover - defensive
             self.logger.warning("Failed to save procedural skill: %s", exc)
 
-    def _skill_context_metadata(self, actions: List[Dict[str, Any]]) -> tuple[Dict[str, Any], Dict[str, Any]]:
-        labels: set[str] = set()
-        roles: set[str] = set()
-        paths: set[str] = set()
-        for act in actions or []:
-            for key in ("semantic_label", "label"):
-                value = str(act.get(key) or "").strip()
-                if value and "{" not in value:
-                    labels.add(value[:120])
-            for key in ("semantic_role", "role"):
-                value = str(act.get(key) or "").strip()
-                if value:
-                    roles.add(value[:80])
-            value = str(act.get("semantic_path") or act.get("path") or "").strip()
-            if value and "{" not in value:
-                paths.add(value[:180])
-        computer = getattr(self, "computer", None)
-        preconditions = {"platform": getattr(computer, "platform_name", "unknown")}
-        grounding_signature = {
-            "labels": sorted(labels),
-            "roles": sorted(roles),
-            "paths": sorted(paths),
-        }
-        return preconditions, grounding_signature
 
-    def _slugify(self, text: str) -> str:
-        """Lightweight slug for skill names."""
-        if not text:
-            return ""
-        lowered = text.strip().lower()
-        slug = re.sub(r"[^a-z0-9]+", "-", lowered).strip("-")
-        return slug or "macro"
 
     def _persist_episode(self, user_prompt: str, state: StateManager, plan: Optional[Plan]) -> None:
         episode_id = plan.id if plan else f"session-{int(state.started_at)}"
