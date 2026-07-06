@@ -104,6 +104,9 @@ class RecoveryDecision:
     force_vision_next_turn: bool = False
     reason: str = ""
     hint: str = ""
+    # Escalate to the human: ask for guidance instead of looping on recovery.
+    request_user_input: bool = False
+    user_prompt: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

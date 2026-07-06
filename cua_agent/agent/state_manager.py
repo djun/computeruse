@@ -29,6 +29,12 @@ class ActionResult:
     success: bool
     reason: str = ""
     metadata: Dict[str, Any] = field(default_factory=dict)
+    # Structured failure contract so the model/runtime can react to codes
+    # instead of parsing free-text reasons. All optional for compatibility.
+    code: str = ""
+    category: str = ""  # policy | grounding | capability | execution | verification | schema | timeout
+    retryable: bool | None = None
+    suggested_next: List[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -45,6 +51,82 @@ class VerificationContract:
         if self.expected_state:
             payload["expected_state"] = self.expected_state
         return payload
+
+
+# expected_effect kinds the model may declare; the runtime translates each into
+# the cheapest sensor able to verify it plus an expected_state in the grammar
+# that VerificationManager already evaluates.
+EXPECTED_EFFECT_KINDS: tuple[str, ...] = (
+    "text_appears",
+    "text_disappears",
+    "field_value_changed",
+    "visual_changed",
+    "clipboard_changed",
+    "app_opened",
+    "app_focused",
+    "window_focused",
+    "page_navigated",
+    "file_created",
+    "file_deleted",
+    "state_changed",
+    "no_change",
+)
+
+
+def contract_from_expected_effect(effect: Any) -> Optional[Dict[str, Any]]:
+    """Translate a model-declared expected_effect into a verification contract.
+
+    The model states WHAT should happen; this picks HOW to verify it (sensor +
+    expected_state). Returns None when the effect is absent or unrecognized so
+    callers can fall back to per-action sensor defaults.
+    """
+    if not isinstance(effect, dict):
+        return None
+    kind = str(effect.get("kind") or "").strip().lower()
+    value = str(effect.get("value") or "").strip()
+
+    sensor: str
+    expected_state: str | None
+    if kind in {"text_appears", "field_value_changed"}:
+        sensor, expected_state = "a11y_tree", (f"text_exists:{value}" if value else "state_change")
+    elif kind == "text_disappears":
+        if not value:
+            return None
+        sensor, expected_state = "a11y_tree", f"text_not_exists:{value}"
+    elif kind == "visual_changed":
+        sensor, expected_state = "pixel_diff", "state_change"
+    elif kind == "clipboard_changed":
+        sensor, expected_state = "os_telemetry", (f"clipboard_contains:{value}" if value else "clipboard_changed")
+    elif kind == "app_opened":
+        sensor, expected_state = "os_telemetry", (f"process_exists:{value}" if value else "state_change")
+    elif kind in {"app_focused", "window_focused"}:
+        sensor, expected_state = "os_telemetry", (f"app_focused:{value}" if value else "state_change")
+    elif kind == "page_navigated":
+        if value:
+            sensor, expected_state = "a11y_tree", f"url_contains:{value}"
+        else:
+            sensor, expected_state = "pixel_diff", "state_change"
+    elif kind == "file_created":
+        sensor, expected_state = "os_telemetry", (f"file_exists:{value}" if value else "state_change")
+    elif kind == "file_deleted":
+        sensor, expected_state = "os_telemetry", (f"file_not_exists:{value}" if value else "state_change")
+    elif kind == "state_changed":
+        sensor, expected_state = "a11y_tree", "state_change"
+    elif kind == "no_change":
+        sensor, expected_state = "none", None
+    else:
+        return None
+
+    contract: Dict[str, Any] = {"sensor": sensor}
+    if expected_state:
+        contract["expected_state"] = expected_state
+    timeout_raw = effect.get("timeout_seconds")
+    if timeout_raw is not None:
+        try:
+            contract["timeout_seconds"] = int(timeout_raw)
+        except (TypeError, ValueError):
+            pass
+    return contract
 
 
 @dataclass
@@ -216,6 +298,14 @@ class StateManager:
             "path": action.get("path"),
             "execution": action.get("execution"),
         }
+        if result.code:
+            action_summary["code"] = result.code
+            if result.category:
+                action_summary["category"] = result.category
+            if result.retryable is not None:
+                action_summary["retryable"] = result.retryable
+            if result.suggested_next:
+                action_summary["suggested_next"] = list(result.suggested_next)
         self.history.append(f"action:{action_summary}")
         browser_summary = self._summarize_browser_result(action, result)
         if browser_summary:

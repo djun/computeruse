@@ -150,9 +150,7 @@ class PlannerClient:
             "- 'description': Specific and Action-oriented.\n"
             "- 'success_criteria': Measurable and VISUAL.\n"
             "- Mark the first step status as 'in_progress'.\n"
-            "Output format: \n"
-            "REASONING: <your thought process>\n"
-            "PLAN_JSON: <the valid JSON object>"
+            "Output only the plan JSON object matching the schema."
         )
         
         user_content = [
@@ -214,9 +212,7 @@ class PlannerClient:
             "- Mark steps as done if satisfied.\n"
             "- Mark blocked steps as failed.\n"
             "- Ensure exactly one step is 'in_progress'.\n"
-            "Output format: \n"
-            "REASONING: <text>\n"
-            "PLAN_JSON: <json>"
+            "Output only the updated plan JSON object matching the schema."
         )
         plan_json = json.dumps(plan.to_dict())
         user_content = [
@@ -330,19 +326,20 @@ class PlannerClient:
             except Exception:
                 continue
         if not steps:
+            # No generic step-level expected_state: resolve_contract would force
+            # it onto every action regardless of the resolved sensor, hard-failing
+            # valid actions. Matches the make_plan no-client/failure fallbacks.
             steps = [
                 Step(
                     id=0,
                     description="Inspect the desktop and orient to the request",
                     success_criteria="Relevant app or window is visible and ready",
-                    expected_state="text_exists:ready",
                     status="in_progress",
                 ),
                 Step(
                     id=1,
                     description=f"Execute the task: {user_prompt}",
                     success_criteria="On-screen confirmation of the completed request (visible result, file, or page)",
-                    expected_state="state_change",
                 ),
             ]
         plan = Plan(
@@ -367,8 +364,11 @@ class PlannerClient:
         for idx, step in enumerate(plan.steps):
             if step.status not in allowed_status:
                 step.status = "pending"
-            if not step.expected_state:
-                step.expected_state = step.success_criteria or step.description
+            # Deliberately do NOT backfill expected_state from success_criteria/
+            # description: a generic step-level expected_state is forced onto
+            # every action by resolve_contract regardless of the resolved sensor,
+            # hard-failing valid actions (see the make_plan fallback comment).
+            # Action-level expected_effect provides the concrete contract instead.
             step.recovery_steps = self._string_list(step.recovery_steps)
             step.sub_steps = self._string_list(step.sub_steps)
             step.preferred_sensor = self._enum_value(step.preferred_sensor, allowed_sensors, "a11y_tree")

@@ -80,4 +80,4 @@ def test_cognitive_core_maps_zoom_action() -> None:
 def test_cognitive_core_zoom_requires_region() -> None:
     core = CognitiveCore(Settings(use_openrouter=False), _DummyComputer())
     mapped = core._map_single_computer_action({"action": "zoom"})
-    assert mapped["type"] == "noop"
+    assert mapped["type"] == "invalid_action"

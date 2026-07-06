@@ -13,6 +13,7 @@ from typing import Any
 from cua_agent.agent.state_manager import ActionResult
 from cua_agent.computer.adapter import ComputerAdapter
 from cua_agent.computer.drivers import BaseVisionPipeline
+from cua_agent.computer.types import Capability
 from cua_agent.utils.config import Settings
 
 
@@ -22,6 +23,75 @@ class DriverBackedComputerAdapter(ComputerAdapter):
 
     def run_health_checks(self, settings: Settings, logger: Any | None = None) -> None:
         raise NotImplementedError
+
+    def describe_capabilities(self) -> list[Capability]:
+        """What actually works right now for this OS/profile/flags.
+
+        Derived from settings so the model chooses among actions the runtime
+        declared valid, instead of discovering blocked paths by failing.
+        """
+        settings = self.settings
+        caps: list[Capability] = [Capability("screenshot", True, "real")]
+
+        if not settings.allows_gui_actions():
+            caps.append(
+                Capability(
+                    "gui_input",
+                    False,
+                    "blocked",
+                    f"execution profile '{settings.execution_profile}' blocks GUI actions",
+                )
+            )
+        elif not settings.sends_real_input():
+            reason = "SIMULATION_MODE is on" if settings.simulation_mode else "ENABLE_HID=false"
+            caps.append(Capability("gui_input", True, "dry_run", f"{reason}; no real input is sent"))
+        else:
+            caps.append(Capability("gui_input", True, "real"))
+
+        if not settings.allows_gui_actions():
+            caps.append(Capability("semantic_ui", False, "blocked", "GUI actions blocked by execution profile"))
+        elif not settings.enable_semantic:
+            caps.append(Capability("semantic_ui", False, "blocked", "ENABLE_SEMANTIC=false"))
+        else:
+            caps.append(Capability("semantic_ui", True, "real"))
+
+        if not settings.allows_browser_actions():
+            caps.append(
+                Capability(
+                    "browser_dom",
+                    False,
+                    "blocked",
+                    f"execution profile '{settings.execution_profile}' blocks browser actions",
+                )
+            )
+        elif self.platform_name.lower().startswith("windows") and settings.windows_cyborg_mode:
+            caps.append(
+                Capability(
+                    "browser_dom",
+                    True,
+                    "degraded",
+                    "Windows Cyborg mode: CDP may be unavailable; prefer GUI actions",
+                )
+            )
+        else:
+            caps.append(Capability("browser_dom", True, "real"))
+
+        if not settings.allows_shell_actions():
+            caps.append(
+                Capability(
+                    "shell",
+                    False,
+                    "blocked",
+                    f"execution profile '{settings.execution_profile}' blocks shell actions",
+                )
+            )
+        elif not settings.enable_shell:
+            caps.append(Capability("shell", False, "blocked", "ENABLE_SHELL=false"))
+        else:
+            caps.append(Capability("shell", True, "real"))
+
+        caps.append(Capability("clipboard", True, "real"))
+        return caps
 
     def capture_base64(self) -> str:
         return self.vision.capture_base64()

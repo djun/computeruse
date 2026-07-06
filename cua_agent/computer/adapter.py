@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Protocol
 
 from cua_agent.agent.state_manager import ActionResult
-from cua_agent.computer.types import DisplayInfo
+from cua_agent.computer.types import Capability, DisplayInfo
 from cua_agent.utils.config import Settings
 
 
@@ -31,4 +31,6 @@ class ComputerAdapter(Protocol):
 
     def get_active_window_tree(self, max_depth: int = 5) -> ActionResult: ...
     def execute(self, action: dict) -> ActionResult: ...
+
+    def describe_capabilities(self) -> list[Capability]: ...
 

@@ -72,7 +72,10 @@ def test_planner_repairs_invariants_and_fills_react_fields() -> None:
 
     assert parsed["current_step_index"] == 1
     assert parsed["steps"][0]["status"] == "done"
-    assert parsed["steps"][0]["expected_state"] == "App visible"
+    # expected_state is deliberately NOT backfilled from success_criteria: a
+    # generic step-level expected_state hard-fails valid actions when forced
+    # onto a sensor that cannot evaluate it (see planner fallback comment).
+    assert parsed["steps"][0]["expected_state"] == ""
     assert parsed["steps"][0]["preferred_sensor"] == "vision_full"
     assert parsed["steps"][0]["risk_level"] == "medium"
     assert parsed["steps"][0]["grounding_strategy"] == "fusion_required"

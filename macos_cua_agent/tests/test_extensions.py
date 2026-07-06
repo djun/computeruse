@@ -213,13 +213,13 @@ class TestExtensions(unittest.TestCase):
     def test_map_wait_for_element_rejects_coordinate_only(self):
         args = {"action": "wait_for_element", "x": 10, "y": 20, "timeout": 5}
         result = self.core._map_single_computer_action(args)
-        self.assertEqual(result["type"], "noop")
+        self.assertEqual(result["type"], "invalid_action")
         self.assertIn("requires element_id/element_ref", result["reason"])
 
     def test_map_scroll_to_element_rejects_coordinate_only(self):
         args = {"action": "scroll_to_element", "x": 10, "y": 20, "timeout": 5}
         result = self.core._map_single_computer_action(args)
-        self.assertEqual(result["type"], "noop")
+        self.assertEqual(result["type"], "invalid_action")
         self.assertIn("requires element_id/element_ref", result["reason"])
 
     def test_map_focus_window(self):
@@ -265,19 +265,19 @@ class TestExtensions(unittest.TestCase):
     def test_profile_blocks_computer_mapping_in_remote_cli(self):
         core = CognitiveCore(Settings(execution_profile="remote_cli"), _DummyComputer())
         result = core._map_tool_args({"action": "left_click", "x": 1, "y": 2})
-        self.assertEqual(result["type"], "noop")
+        self.assertEqual(result["type"], "invalid_action")
         self.assertIn("remote_cli", result["reason"])
 
     def test_profile_blocks_shell_mapping_in_local_gui(self):
         core = CognitiveCore(Settings(execution_profile="local_gui"), _DummyComputer())
         result = core._map_shell_args({"command": "echo hello"})
-        self.assertEqual(result["type"], "noop")
+        self.assertEqual(result["type"], "invalid_action")
         self.assertIn("local_gui", result["reason"])
 
     def test_shell_mapping_blocked_when_shell_flag_disabled(self):
         core = CognitiveCore(Settings(execution_profile="remote_cli", enable_shell=False), _DummyComputer())
         result = core._map_shell_args({"command": "echo hello"})
-        self.assertEqual(result["type"], "noop")
+        self.assertEqual(result["type"], "invalid_action")
         self.assertIn("ENABLE_SHELL=false", result["reason"])
 
     def test_cognitive_core_text_only_turn_omits_image_payload(self):

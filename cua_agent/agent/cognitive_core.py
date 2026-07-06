@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 from urllib.parse import urlparse
 
-from cua_agent.agent.state_manager import VERIFICATION_SENSOR_HIERARCHY
+from cua_agent.agent.state_manager import (
+    EXPECTED_EFFECT_KINDS,
+    VERIFICATION_SENSOR_HIERARCHY,
+    contract_from_expected_effect,
+)
 from cua_agent.computer.adapter import ComputerAdapter
-from cua_agent.computer.types import COMPUTER_ACTION_SPACE
+from cua_agent.computer.types import COMPUTER_ACTION_SPACE, OBSERVATION_ACTION_TYPES
 from cua_agent.orchestrator.react_types import ActionEnvelope, GroundingBundle
 from cua_agent.utils.config import Settings
 from cua_agent.utils.image_mime import configured_image_mime, image_data_uri
@@ -109,6 +114,31 @@ COMPUTER_TOOL = {
                                 "type": "string",
                                 "description": "Short reason for this action choice (for debug observability).",
                             },
+                            "reason": {"type": "string"},
+                            "mode": {
+                                "type": "string",
+                                "enum": ["auto", "screenshot", "ui_tree", "fused", "zoom", "none"],
+                            },
+                            "region": {
+                                "type": "array",
+                                "items": {"type": "number"},
+                                "minItems": 4,
+                                "maxItems": 4,
+                            },
+                            "target": {
+                                "type": "object",
+                                "properties": {
+                                    "element_id": {"oneOf": [{"type": "integer"}, {"type": "string"}]},
+                                    "label": {"type": "string"},
+                                    "x": {"type": "number"},
+                                    "y": {"type": "number"},
+                                },
+                                "additionalProperties": False,
+                            },
+                            # No per-subaction expected_effect: a macro is verified
+                            # once at the block level (top-level expected_effect /
+                            # verification), so a per-item effect would carry but
+                            # never run — false coverage. Declare it on the block.
                         },
                         "required": ["action"],
                         "additionalProperties": False,
@@ -137,7 +167,16 @@ COMPUTER_TOOL = {
                     "items": {"type": "number"},
                     "minItems": 4,
                     "maxItems": 4,
-                    "description": "For 'zoom': [x1,y1,x2,y2] region in logical points to re-capture at higher detail. Return follow-up coordinates in the original screenshot space.",
+                    "description": "For 'zoom'/'observe' mode=zoom: [x1,y1,x2,y2] region in logical points to re-capture at higher detail. Return follow-up coordinates in the original screenshot space.",
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["auto", "screenshot", "ui_tree", "fused", "zoom", "none"],
+                    "description": (
+                        "For 'observe': what to refresh before the next decision — auto (runtime decides), "
+                        "screenshot (fresh image), ui_tree (AX/UIA tree only), fused (screenshot + grounding candidates), "
+                        "zoom (requires region), none (explicitly skip observation this turn)."
+                    ),
                 },
                 "text": {"type": "string", "description": "Text to type."},
                 "app_name": {"type": "string", "description": "Name of the application to open (for 'open_app' action)."},
@@ -151,6 +190,22 @@ COMPUTER_TOOL = {
                     "description": (
                         "Element reference. Can be a numbered overlay ID or semantic identifier token."
                     ),
+                },
+                "target": {
+                    "type": "object",
+                    "description": (
+                        "Structured target for click/input_text/drag and other targeted actions. "
+                        "Provide ONE of: {\"element_id\": <overlay id or semantic token>}, "
+                        "{\"label\": \"visible control label\"}, or {\"x\": .., \"y\": ..} in logical points. "
+                        "Preferred over loose top-level x/y/element_id."
+                    ),
+                    "properties": {
+                        "element_id": {"oneOf": [{"type": "integer"}, {"type": "string"}]},
+                        "label": {"type": "string"},
+                        "x": {"type": "number"},
+                        "y": {"type": "number"},
+                    },
+                    "additionalProperties": False,
                 },
                 "seconds": {
                     "type": "number",
@@ -211,11 +266,28 @@ COMPUTER_TOOL = {
                     "description": "If false, skip post-action verification delay and change-detection capture.",
                     "default": True,
                 },
+                "expected_effect": {
+                    "type": "object",
+                    "description": (
+                        "Declare WHAT this action should produce; the runtime picks the cheapest sensor able "
+                        "to verify it. Preferred over hand-picking verification.sensor."
+                    ),
+                    "properties": {
+                        "kind": {"type": "string", "enum": list(EXPECTED_EFFECT_KINDS)},
+                        "value": {
+                            "type": "string",
+                            "description": "Text/app name/file path the effect refers to (expected visible text, process name, path, url fragment).",
+                        },
+                        "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 30},
+                    },
+                    "required": ["kind"],
+                    "additionalProperties": False,
+                },
                 "verification": {
                     "type": "object",
                     "description": (
-                        "Verification contract for this action block. "
-                        "Always choose the cheapest sensor that can prove success."
+                        "Explicit verification contract (advanced). Prefer `expected_effect`; "
+                        "use this only to force a specific sensor."
                     ),
                     "properties": {
                         "sensor": {
@@ -257,6 +329,23 @@ COMPUTER_TOOL = {
                 "rationale": {
                     "type": "string",
                     "description": "Short reason for choosing this action (for debug observability).",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Why this action was chosen. Required for 'done' (why the task is complete).",
+                },
+                "evidence": {
+                    "type": "string",
+                    "description": "For 'done': concrete evidence that the task succeeded (visible text, file path, final state).",
+                },
+                "question": {
+                    "type": "string",
+                    "description": "For 'ask_user': the question the human must answer to unblock the task.",
+                },
+                "kind": {
+                    "type": "string",
+                    "enum": ["credential_required", "captcha", "ambiguity", "permission", "external_device", "other"],
+                    "description": "For 'ask_user': why human input is needed.",
                 },
             },
             "required": ["action"],
@@ -422,6 +511,7 @@ class CognitiveCore:
         self._register_default_tools()
         self.client = self._build_client()
         self.tokens_used = 0
+        self.last_context_report: Dict[str, Any] = {}
         self._log_execution_profile_startup()
 
     def _tool_enabled_map(self) -> Dict[str, bool]:
@@ -589,7 +679,7 @@ class CognitiveCore:
     ) -> ActionEnvelope:
         """Return a structured operational envelope around the next action."""
         if not self.client:
-            action_type = "noop" if history else "capture_only"
+            action_type = "done" if history else "capture_only"
             action = {"type": action_type, "reason": "Cognitive core running without OpenRouter client."}
             return ActionEnvelope(
                 observation_summary=action["reason"],
@@ -628,6 +718,8 @@ class CognitiveCore:
         except Exception as exc:  # pragma: no cover - defensive fallback
             self.logger.exception("OpenRouter call failed; falling back to noop.", exc_info=exc)
 
+        # Transient model/API failure: a noop lets the loop retry (bounded by the
+        # orchestrator's consecutive-stall guard) instead of ending the task.
         action = {"type": "noop", "reason": "Failed to generate action"}
         return ActionEnvelope(observation_summary=action["reason"], action=action, confidence=0.0)
 
@@ -652,11 +744,6 @@ class CognitiveCore:
 
         plan_text = "No structured plan; infer progress from the user's request."
         if plan and current_step:
-            upcoming = [
-                f"- Step {s.id}: {s.description} (status={s.status})"
-                for s in plan.steps
-                if s.id != current_step.id
-            ]
             plan_text = (
                 "Current goal:\n"
                 f"- Step {current_step.id}: {current_step.description}\n"
@@ -664,8 +751,12 @@ class CognitiveCore:
             )
             if getattr(current_step, "expected_state", ""):
                 plan_text += f"- Expected state: {current_step.expected_state}\n"
-            if upcoming:
-                plan_text += "Upcoming steps (context only):\n" + "\n".join(upcoming[:4])
+            # Plan slice: only the immediate next step. The full plan lives in
+            # the runtime; later steps rarely change the next action but cost
+            # tokens every turn.
+            next_step = self._next_pending_step(plan, current_step)
+            if next_step:
+                plan_text += f"Next step (context only): {next_step.description}\n"
         elif plan:
             plan_lines = [f"- Step {s.id}: {s.description} (status={s.status})" for s in plan.steps]
             plan_text = "Plan:\n" + "\n".join(plan_lines)
@@ -683,40 +774,37 @@ class CognitiveCore:
         skills_context = ""
         if relevant_skills:
             skills_lines = []
-            for s in relevant_skills:
-                param_blob = ""
-                if getattr(s, "parameters", None):
-                    rendered_params = []
-                    for key, spec in (s.parameters or {}).items():
-                        required = False
-                        description = ""
-                        if isinstance(spec, dict):
-                            required = bool(spec.get("required", False))
-                            description = str(spec.get("description", "")).strip()
-                        elif isinstance(spec, str):
-                            description = spec.strip()
-                        suffix = " (required)" if required else ""
-                        if description:
-                            rendered_params.append(f"{key}{suffix}: {description}")
-                        else:
-                            rendered_params.append(f"{key}{suffix}")
-                    if rendered_params:
-                        param_blob = " | params: " + "; ".join(rendered_params[:5])
-                skills_lines.append(f"- {s.name} (ID: {s.id}): {s.description}{param_blob}")
+            for s in relevant_skills[:3]:
+                arg_names = ", ".join(list((getattr(s, "parameters", None) or {}).keys())[:5])
+                description = str(getattr(s, "description", "") or "")[:80]
+                skills_lines.append(f"- {s.name} (ID: {s.id}) args=[{arg_names}]: {description}")
             skills_context = (
-                "\nRelevant Skills/Macros:\n"
+                "\nRelevant skills (run_skill with the ID; pass skill_args for the listed args):\n"
                 + "\n".join(skills_lines)
-                + "\nUse `run_skill` with the ID and pass `skill_args` when the skill exposes params.\n"
+                + "\n"
             )
 
-        ax_context = ""
-        som_context = ""
-        if ax_tree:
+        # One primary UI representation per turn: the AX tree, SoM tags, and
+        # fused candidates all describe the same screen; sending all three
+        # multiplies cost without adding signal. Candidates are ranked against
+        # the current step so ~12 relevant entries replace full dumps.
+        target_query = user_prompt or ""
+        if current_step is not None:
+            target_query = (
+                f"{getattr(current_step, 'description', '')} {getattr(current_step, 'success_criteria', '')}"
+            )
+        ranked_nodes = (
+            self._rank_ui_candidates(grounding.prompt_nodes(limit=100), target_query) if grounding else []
+        )
+        ranked_tags = self._rank_ui_candidates(list(som_tags or []), target_query)
+
+        def _build_ax_context() -> str:
             ax_str = self._summarize_ax_tree(ax_tree)
-            ax_context = f"\nVisible UI Semantic Structure (summarized):\n{ax_str}\n"
-        if som_tags:
+            return f"\nVisible UI Semantic Structure (summarized):\n{ax_str}\n"
+
+        def _build_som_context() -> str:
             som_lines = []
-            for tag in som_tags[:50]:
+            for tag in ranked_tags:
                 frame = tag.get("frame", {})
                 som_lines.append(
                     f"#{tag.get('id')}: gid={tag.get('gid','')} source={tag.get('source','')} "
@@ -733,28 +821,56 @@ class CognitiveCore:
                     "\nNumbered overlay marks are drawn on the screenshot. "
                     "Use element_id to reference these instead of guessing coordinates.\n"
                 )
-            som_context = som_header + "\n".join(som_lines)
+            return som_header + "\n".join(som_lines)
 
-        grounding_context = ""
-        if grounding:
+        def _build_grounding_context() -> str:
             candidate_lines = []
-            for node in grounding.prompt_nodes(limit=40):
+            for node in ranked_nodes:
                 frame = node.get("frame", {})
                 candidate_lines.append(
                     f"- {node.get('gid')}: source={node.get('source')} role={node.get('role')} "
                     f"label={node.get('label')} confidence={node.get('confidence')} "
                     f"frame=({frame.get('x')},{frame.get('y')},{frame.get('w')},{frame.get('h')})"
                 )
-            grounding_context = (
+            return (
                 "\nFused grounding candidates (semantic + visual):\n"
                 + ("\n".join(candidate_lines) if candidate_lines else "- none")
                 + f"\nGrounding quality: {grounding.quality}\n"
             )
 
+        ax_context = ""
+        som_context = ""
+        grounding_context = ""
+        if self.settings.prefer_native_coordinates:
+            # Native mode: fused candidates are the primary aid.
+            if ranked_nodes:
+                grounding_context = _build_grounding_context()
+            elif ranked_tags:
+                som_context = _build_som_context()
+            elif ax_tree:
+                ax_context = _build_ax_context()
+        else:
+            # Overlay mode: the numbered SoM listing is the element_id reference
+            # space the model clicks by, so it must stay primary.
+            if ranked_tags:
+                som_context = _build_som_context()
+            elif ranked_nodes:
+                grounding_context = _build_grounding_context()
+            elif ax_tree:
+                ax_context = _build_ax_context()
+        if not include_visual_context and ax_tree and not ax_context:
+            # Text-only turn: the summarized tree is the only structural view of
+            # the screen, complementing the flat candidate list.
+            ax_context = _build_ax_context()
+
         state_view_context = ""
         if state_view:
             try:
-                state_view_context = "\nTyped state view:\n" + json.dumps(state_view, ensure_ascii=False)[:3000]
+                view = dict(state_view)
+                # recent_history duplicates the "Recent events" block already in
+                # the prompt; drop it from the typed view.
+                view.pop("recent_history", None)
+                state_view_context = "\nTyped state view:\n" + json.dumps(view, ensure_ascii=False)[:3000]
             except Exception:
                 state_view_context = ""
 
@@ -847,10 +963,11 @@ class CognitiveCore:
             Execution profile: {self.settings.execution_profile}.
             Toolbox:
             {chr(10).join(tool_lines)}
+            {self._capabilities_context()}
 
             At each step you receive textual history, and may also receive a screenshot of the current display.
             - You may return a *macro action* by supplying `actions: [...]` to batch multiple low-level steps in one call.
-            - Every action block MUST include a `verification` contract with `sensor`, optional `expected_state`, and `timeout_seconds`.
+            - For state-changing actions, declare the outcome with `expected_effect` (kind + value), e.g. {{"kind": "text_appears", "value": "Dashboard"}}; the runtime picks the sensor to verify it. Use an explicit `verification` contract only to force a specific sensor.
             {plan_text}
             {loop_state_text}
             {skills_context}
@@ -864,8 +981,10 @@ class CognitiveCore:
             - Always reason from what is currently visible: windows, icons, menus.
             {grounding_guidance}
             - Keep any non-tool text to a short operational summary; do not expose long reasoning.
+            - When you are uncertain about the current screen state, use `observe` to request fresh context before acting: mode=screenshot|fused for visual state, mode=ui_tree for the accessibility tree only, mode=zoom (with region) for fine detail. It ends the turn and fresh context arrives next turn.
             - Use `inspect_ui` if visual elements are ambiguous or you need to find hidden controls.
             - To reduce latency, prefer batching obvious sequences (e.g., click + type + enter) using `actions`.
+            - Do NOT mix observation actions (screenshot/zoom/inspect_ui/probe_ui) or 'done' with executable steps inside one macro: an observation ends the turn, so the macro is truncated there and trailing steps are dropped.
             - Sensor pyramid (prefer cheapest): `none` -> `os_telemetry` -> `a11y_tree` -> `pixel_diff` -> `vision_full`.
             - Use `vision_full` only when context is lost, UI is purely visual, or cheaper validation failed.
             {browser_research_lines}
@@ -881,9 +1000,14 @@ class CognitiveCore:
             {shell_safety_lines}
             
             Action Selection
+            - Preferred action API: observe, click, input_text, press_keys, scroll, drag, wait, open_app, focus, clipboard, run_skill, done. Legacy action names remain valid.
+            - For targeted actions, prefer the structured `target` field: {{"element_id": 12}}, {{"label": "Search"}}, or {{"x": .., "y": ..}} (logical points) instead of loose top-level arguments.
             - Prefer batching obvious sequences using the `actions` array (macro_actions) to cut latency.
             {browser_preference_line}
             - Prefer `inspect_ui` over random guessing of coordinates.
+            - When the user's task is fully complete, return action='done' with `reason` and concrete `evidence`; do not keep exploring after completion.
+            - If a previous tool call was rejected as invalid, fix the arguments and try again; invalid calls do not end the task.
+            - When blocked by something only a human can resolve (login/credentials, captcha, MFA, OS permission dialogs, ambiguous instructions), use action='ask_user' with a clear `question` and `kind` instead of guessing.
             
             Recent events:
             {history[-10:]}
@@ -895,6 +1019,22 @@ class CognitiveCore:
             )
         if repeat_info and repeat_info.get("hint"):
             system_prompt += f" Hint from verifier: {repeat_info['hint']}."
+
+        self.last_context_report = self._estimate_context_blocks(
+            {
+                "plan": plan_text,
+                "loop_state": loop_state_text,
+                "skills": skills_context,
+                "ax": ax_context,
+                "som": som_context,
+                "candidates": grounding_context,
+                "state_view": state_view_context,
+                "history": str(history[-10:]),
+                "system_total": system_prompt,
+            },
+            include_image=bool(include_visual_context and observation_b64),
+        )
+        self.logger.info("context_blocks: %s", self.last_context_report)
 
         fallback_mime = configured_image_mime(self.settings.encode_format)
 
@@ -945,6 +1085,69 @@ class CognitiveCore:
         self.tokens_used += usage_tokens(response)
         return response
 
+    @staticmethod
+    def _next_pending_step(plan: "Plan", current_step: "Step") -> Optional["Step"]:
+        """First unfinished step after the current one (for the plan slice)."""
+        steps = list(getattr(plan, "steps", []) or [])
+        try:
+            idx = steps.index(current_step)
+        except ValueError:
+            idx = int(getattr(plan, "current_step_index", 0) or 0)
+        for step in steps[idx + 1 :]:
+            if getattr(step, "status", "") in {"pending", "in_progress"}:
+                return step
+        return None
+
+    @staticmethod
+    def _rank_ui_candidates(
+        nodes: List[Dict[str, Any]], query: str, limit: int = 12
+    ) -> List[Dict[str, Any]]:
+        """Rank UI nodes/tags by keyword overlap with the current step, then confidence."""
+        if not nodes:
+            return []
+        tokens = set(re.findall(r"[a-z0-9]{3,}", (query or "").lower()))
+
+        def _score(node: Dict[str, Any]) -> tuple[int, float]:
+            text = f"{node.get('label') or ''} {node.get('role') or ''}".lower()
+            overlap = sum(1 for token in tokens if token in text)
+            try:
+                confidence = float(node.get("confidence") or 0.0)
+            except (TypeError, ValueError):
+                confidence = 0.0
+            return (overlap, confidence)
+
+        return sorted(nodes, key=_score, reverse=True)[:limit]
+
+    @staticmethod
+    def _estimate_context_blocks(blocks: Dict[str, str], include_image: bool) -> Dict[str, Any]:
+        """~4 chars/token per prompt block, to locate where context cost leaks."""
+        report: Dict[str, Any] = {name: len(text or "") // 4 for name, text in blocks.items()}
+        report["image"] = bool(include_image)
+        return report
+
+    def _capabilities_context(self) -> str:
+        """Render the adapter's capability manifest for the system prompt."""
+        describe = getattr(self.computer, "describe_capabilities", None)
+        if not callable(describe):
+            return ""
+        try:
+            capabilities = describe() or []
+        except Exception as exc:
+            self.logger.warning("describe_capabilities failed: %s", exc)
+            return ""
+        if not capabilities:
+            return ""
+        lines = []
+        for cap in capabilities:
+            line = f"- {cap.name}: {cap.mode}"
+            if cap.reason:
+                line += f" ({cap.reason})"
+            lines.append(line)
+        return (
+            "\nCurrent capabilities (choose only among available ones; do not attempt blocked ones):\n"
+            + "\n".join(lines)
+        )
+
     def _available_tools(self) -> List[Dict[str, Any]]:
         self._ensure_tool_registry()
         tools: List[Dict[str, Any]] = []
@@ -968,8 +1171,13 @@ class CognitiveCore:
         message = choices[0].message
         tool_calls = getattr(message, "tool_calls", None)
         if not tool_calls:
-            # No tool call means the model replied with text; treat as noop.
-            return {"type": "noop", "reason": "model returned text"}
+            # No tool call means the model replied with text: the natural
+            # completion signal. Surface the text as evidence.
+            text = str(getattr(message, "content", "") or "").strip()
+            payload = {"type": "done", "reason": "model returned text response"}
+            if text:
+                payload["evidence"] = text[:600]
+            return payload
 
         first = tool_calls[0]
         tool_name = getattr(first.function, "name", None)
@@ -977,43 +1185,80 @@ class CognitiveCore:
         try:
             args = json.loads(args_raw or "{}")
         except json.JSONDecodeError:
-            return {"type": "noop", "reason": f"bad tool args: {args_raw}"}
+            return {"type": "invalid_action", "reason": f"bad tool args: {args_raw}"}
 
         registration = self._tool_registry.get(str(tool_name or ""))
         if not registration:
-            return {"type": "noop", "reason": f"unknown tool {tool_name}"}
+            return {"type": "invalid_action", "reason": f"unknown tool {tool_name}"}
 
         try:
             mapped = registration.mapper(self, args)
         except Exception as exc:
             self.logger.exception("tool mapper failed for '%s'", tool_name, exc_info=exc)
-            return {"type": "noop", "reason": f"tool mapper failed: {tool_name}"}
+            return {"type": "invalid_action", "reason": f"tool mapper failed: {tool_name}"}
 
         if isinstance(mapped, dict):
             return mapped
-        return {"type": "noop", "reason": f"tool mapper returned invalid payload: {tool_name}"}
+        return {"type": "invalid_action", "reason": f"tool mapper returned invalid payload: {tool_name}"}
 
     def _map_tool_args(self, args: Dict[str, Any]) -> Dict[str, Any]:
         if not self.settings.allows_gui_actions():
             return {
-                "type": "noop",
+                "type": "invalid_action",
                 "reason": f"execution profile '{self.settings.execution_profile}' blocks GUI actions",
             }
 
         # Macro-action path: a list of sub-actions
         if isinstance(args.get("actions"), list):
             mapped_actions = []
+            invalid_reasons = []
+            observe_after = False
+            truncation_note = ""
             for sub in args["actions"]:
                 if not isinstance(sub, dict):
                     continue
                 mapped = self._map_single_computer_action(sub)
-                if mapped.get("type") != "noop":
-                    mapped_actions.append(mapped)
+                sub_type = str(mapped.get("type") or "")
+                if sub_type == "invalid_action":
+                    invalid_reasons.append(str(mapped.get("reason") or "invalid sub-action"))
+                    continue
+                if sub_type == "noop":
+                    continue
+                if sub_type == "macro_actions":
+                    # A sub-action may itself expand into a small macro (e.g.
+                    # targetless input_text with submit); flatten it because the
+                    # action engine rejects nested macros.
+                    mapped_actions.extend(mapped.get("actions") or [])
+                    continue
+                if sub_type == "done" or sub_type in OBSERVATION_ACTION_TYPES:
+                    # Observation (and done) must end the turn: any sub-action
+                    # after it would act on context the model has not seen yet.
+                    if not mapped_actions:
+                        return mapped
+                    observe_after = sub_type in OBSERVATION_ACTION_TYPES
+                    truncation_note = (
+                        f"macro truncated at '{sub_type}': observation/done sub-actions end the turn, so it "
+                        "and any trailing sub-actions were dropped; re-issue it standalone if still needed"
+                    )
+                    if observe_after:
+                        truncation_note += "; a fresh screenshot will be provided next turn"
+                    break
+                mapped_actions.append(mapped)
             if not mapped_actions:
-                return {"type": "noop", "reason": "macro_actions provided but no valid sub-actions"}
+                reason = "macro_actions provided but no valid sub-actions"
+                if invalid_reasons:
+                    reason += ": " + "; ".join(invalid_reasons[:3])
+                return {"type": "invalid_action", "reason": reason}
             payload = {"type": "macro_actions", "actions": mapped_actions}
+            if observe_after:
+                payload["observe_after"] = True
+            if truncation_note:
+                payload["truncation_note"] = truncation_note
+            raw_macro_contract = args.get("verification")
+            if not isinstance(raw_macro_contract, dict):
+                raw_macro_contract = contract_from_expected_effect(args.get("expected_effect"))
             contract = self._normalize_verification_contract(
-                args.get("verification"),
+                raw_macro_contract,
                 fallback_sensor="a11y_tree",
                 verify_after=args.get("verify_after"),
             )
@@ -1025,7 +1270,43 @@ class CognitiveCore:
 
         return self._map_single_computer_action(args)
 
+    # Clean-API aliases exposed to the model; each maps onto a legacy action so
+    # the model never needs to know which execution path (AX, UIA, HID, DOM)
+    # will ultimately serve the intent.
+    _ACTION_ALIASES = {
+        "click": "click_element",
+        "press_keys": "hotkey",
+        "drag": "drag_and_drop",
+        "focus": "focus_window",
+        "clipboard": "clipboard_op",
+    }
+
+    def _normalize_action_args(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Resolve clean-API aliases and hoist the structured `target` field."""
+        action_l = str(args.get("action") or "").strip().lower()
+        alias = self._ACTION_ALIASES.get(action_l)
+        target = args.get("target")
+        if alias is None and not isinstance(target, dict):
+            return args
+
+        normalized = dict(args)
+        if isinstance(target, dict):
+            normalized.pop("target", None)
+            if target.get("element_id") is not None and normalized.get("element_id") is None:
+                normalized["element_id"] = target.get("element_id")
+            label = str(target.get("label") or "").strip()
+            if label and normalized.get("element_id") is None and normalized.get("element_ref") is None:
+                normalized["element_id"] = label
+            if target.get("x") is not None and target.get("y") is not None:
+                normalized.setdefault("x", target.get("x"))
+                normalized.setdefault("y", target.get("y"))
+
+        if alias is not None:
+            normalized["action"] = alias
+        return normalized
+
     def _map_single_computer_action(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        args = self._normalize_action_args(args)
         action = str(args.get("action") or "").strip()
         action_l = action.lower()
         verify_after = args.get("verify_after")
@@ -1033,8 +1314,13 @@ class CognitiveCore:
         def _apply_verify(payload: Dict[str, Any]) -> Dict[str, Any]:
             if verify_after is not None:
                 payload["verify_after"] = bool(verify_after)
+            raw_contract = args.get("verification")
+            if not isinstance(raw_contract, dict):
+                # The model declared WHAT should happen; the runtime picks the
+                # sensor. An explicit verification contract still wins.
+                raw_contract = contract_from_expected_effect(args.get("expected_effect"))
             contract = self._normalize_verification_contract(
-                args.get("verification"),
+                raw_contract,
                 fallback_sensor=self._default_sensor_for_action_type(action_l),
                 verify_after=verify_after,
             )
@@ -1074,7 +1360,7 @@ class CognitiveCore:
             if x is None or y is None:
                 if "element_id" in payload:
                     return _apply_verify(payload)
-                return {"type": "noop", "reason": "move_mouse missing coordinates"}
+                return {"type": "invalid_action", "reason": "move_mouse missing coordinates"}
             payload["x"] = float(x)
             payload["y"] = float(y)
             return _apply_verify(payload)
@@ -1104,7 +1390,7 @@ class CognitiveCore:
                 payload["target_x"] = float(args.get("target_x"))
                 payload["target_y"] = float(args.get("target_y"))
             else:
-                return {"type": "noop", "reason": "drag_and_drop missing target coordinates"}
+                return {"type": "invalid_action", "reason": "drag_and_drop missing target coordinates"}
 
             payload["duration"] = float(args.get("duration", 0.5))
             payload["hold_delay"] = float(args.get("hold_delay", 0.0))
@@ -1119,7 +1405,7 @@ class CognitiveCore:
                 payload["target_x"] = float(args.get("target_x"))
                 payload["target_y"] = float(args.get("target_y"))
             else:
-                return {"type": "noop", "reason": "select_area missing target coordinates"}
+                return {"type": "invalid_action", "reason": "select_area missing target coordinates"}
             payload["duration"] = float(args.get("duration", 0.4))
             payload["hold_delay"] = float(args.get("hold_delay", 0.0))
             return _apply_verify(payload)
@@ -1144,14 +1430,27 @@ class CognitiveCore:
                 payload["radius"] = float(args.get("radius"))
             return _apply_verify(payload)
 
+        if action_l == "observe":
+            mode = str(args.get("mode") or "auto").strip().lower()
+            reason = str(args.get("reason") or "model requested observation").strip()
+            if mode in {"auto", "screenshot", "fused"}:
+                return {"type": "capture_only", "reason": reason, "observe_mode": mode}
+            if mode == "ui_tree":
+                return _apply_verify({"type": "inspect_ui"})
+            if mode == "zoom":
+                return self._map_single_computer_action({**args, "action": "zoom"})
+            if mode == "none":
+                return {"type": "noop", "reason": f"observation explicitly skipped: {reason}"}
+            return {"type": "invalid_action", "reason": f"unknown observe mode '{mode}'"}
+
         if action_l == "zoom":
             region = args.get("region")
             if not isinstance(region, (list, tuple)) or len(region) < 4:
-                return {"type": "noop", "reason": "zoom requires region [x1,y1,x2,y2]"}
+                return {"type": "invalid_action", "reason": "zoom requires region [x1,y1,x2,y2]"}
             try:
                 box = [float(v) for v in list(region)[:4]]
             except (TypeError, ValueError):
-                return {"type": "noop", "reason": "zoom region must be numeric"}
+                return {"type": "invalid_action", "reason": "zoom region must be numeric"}
             payload = {"type": "zoom", "region": box, "verify_after": False}
             if args.get("upscale") is not None:
                 payload["upscale"] = args.get("upscale")
@@ -1160,7 +1459,7 @@ class CognitiveCore:
         if action_l == "clipboard_op":
             sub = args.get("sub_action")
             if not sub:
-                return {"type": "noop", "reason": "clipboard_op missing sub_action"}
+                return {"type": "invalid_action", "reason": "clipboard_op missing sub_action"}
             payload = {"type": "clipboard_op", "sub_action": sub}
             if sub == "write":
                 payload["content"] = args.get("content", "")
@@ -1196,13 +1495,13 @@ class CognitiveCore:
                 payload["click_type"] = click_type
             payload["phantom_mode"] = bool(args.get("phantom_mode", True))
             if "element_ref" not in payload and "x" not in payload:
-                return {"type": "noop", "reason": "click_element missing element_id or coordinates"}
+                return {"type": "invalid_action", "reason": "click_element missing element_id or coordinates"}
             return _apply_verify(payload)
 
         if action_l == "fill_field":
             text = str(args.get("text") or "")
             if not text:
-                return {"type": "noop", "reason": "fill_field missing text"}
+                return {"type": "invalid_action", "reason": "fill_field missing text"}
             payload = {
                 "type": "fill_field",
                 "text": text,
@@ -1216,7 +1515,7 @@ class CognitiveCore:
                 payload["x"] = float(args.get("x"))
                 payload["y"] = float(args.get("y"))
             if "element_ref" not in payload and "x" not in payload:
-                return {"type": "noop", "reason": "fill_field missing element_id or coordinates"}
+                return {"type": "invalid_action", "reason": "fill_field missing element_id or coordinates"}
             return _apply_verify(payload)
 
         if action_l == "wait_for_element":
@@ -1228,7 +1527,7 @@ class CognitiveCore:
                 payload["x"] = float(args.get("x"))
                 payload["y"] = float(args.get("y"))
             if "element_ref" not in payload:
-                return {"type": "noop", "reason": "wait_for_element requires element_id/element_ref"}
+                return {"type": "invalid_action", "reason": "wait_for_element requires element_id/element_ref"}
             return _apply_verify(payload)
 
         if action_l == "wait_for_idle":
@@ -1249,7 +1548,7 @@ class CognitiveCore:
                 payload["x"] = float(args.get("x"))
                 payload["y"] = float(args.get("y"))
             if "element_ref" not in payload:
-                return {"type": "noop", "reason": "scroll_to_element requires element_id/element_ref"}
+                return {"type": "invalid_action", "reason": "scroll_to_element requires element_id/element_ref"}
             return _apply_verify(payload)
 
         if action_l == "read_clipboard":
@@ -1273,13 +1572,41 @@ class CognitiveCore:
         if action_l == "focus_window":
             window_title = str(args.get("window_title") or "").strip()
             if not window_title:
-                return {"type": "noop", "reason": "focus_window missing window_title"}
+                return {"type": "invalid_action", "reason": "focus_window missing window_title"}
             return _apply_verify({"type": "focus_window", "window_title": window_title})
+
+        if action_l == "input_text":
+            text = str(args.get("text") or "")
+            if not text:
+                return {"type": "invalid_action", "reason": "input_text missing text"}
+            submit = bool(args.get("submit", False))
+            has_target = (
+                args.get("element_id") is not None
+                or args.get("element_ref") is not None
+                or (args.get("x") is not None and args.get("y") is not None)
+            )
+            if has_target:
+                # Clean API submits only on request; legacy click_and_type defaults to True.
+                return self._map_single_computer_action(
+                    {**args, "action": "click_and_type", "submit": submit}
+                )
+            # No target: type into the currently focused field.
+            if submit:
+                return _apply_verify(
+                    {
+                        "type": "macro_actions",
+                        "actions": [
+                            {"type": "type", "text": text},
+                            {"type": "key", "keys": ["enter"]},
+                        ],
+                    }
+                )
+            return self._map_single_computer_action({**args, "action": "type"})
 
         if action_l == "click_and_type":
             text = str(args.get("text") or "")
             if not text:
-                return {"type": "noop", "reason": "click_and_type missing text"}
+                return {"type": "invalid_action", "reason": "click_and_type missing text"}
             payload = {
                 "type": "click_and_type",
                 "text": text,
@@ -1294,7 +1621,7 @@ class CognitiveCore:
                 payload["x"] = float(args.get("x"))
                 payload["y"] = float(args.get("y"))
             if "element_ref" not in payload and "x" not in payload:
-                return {"type": "noop", "reason": "click_and_type missing element_id or coordinates"}
+                return {"type": "invalid_action", "reason": "click_and_type missing element_id or coordinates"}
             return _apply_verify(payload)
 
         if action_l == "hotkey":
@@ -1307,6 +1634,20 @@ class CognitiveCore:
             return _apply_verify({"type": "open_app", "app_name": args.get("app_name", "")})
         if action_l == "inspect_ui":
             return _apply_verify({"type": "inspect_ui"})
+        if action_l == "done":
+            payload = {"type": "done", "reason": str(args.get("reason") or "task completed")}
+            evidence = str(args.get("evidence") or "").strip()
+            if evidence:
+                payload["evidence"] = evidence[:600]
+            return payload
+
+        if action_l == "ask_user":
+            question = str(args.get("question") or "").strip()
+            if not question:
+                return {"type": "invalid_action", "reason": "ask_user missing question"}
+            kind = str(args.get("kind") or "other").strip().lower()
+            return {"type": "ask_user", "question": question[:600], "kind": kind}
+
         if action_l == "run_skill":
             payload = {
                 "type": "run_skill",
@@ -1323,7 +1664,7 @@ class CognitiveCore:
                     payload["skill_args"] = cleaned_args
             return _apply_verify(payload)
 
-        return {"type": "noop", "reason": f"unknown action {action_l}"}
+        return {"type": "invalid_action", "reason": f"unknown action {action_l}"}
 
     def _default_sensor_for_action_type(self, action_type: str) -> str:
         token = str(action_type or "").strip().lower()
@@ -1333,6 +1674,7 @@ class CognitiveCore:
             "wait_for_idle",
             "screenshot",
             "zoom",
+            "observe",
             "inspect_ui",
             "probe_ui",
             "read_clipboard",
@@ -1353,6 +1695,7 @@ class CognitiveCore:
             "click_element",
             "fill_field",
             "click_and_type",
+            "input_text",
             "hotkey",
             "key",
             "type",
@@ -1412,19 +1755,19 @@ class CognitiveCore:
     def _map_shell_args(self, args: Dict[str, Any]) -> Dict[str, Any]:
         if not self.settings.allows_shell_actions():
             return {
-                "type": "noop",
+                "type": "invalid_action",
                 "reason": f"execution profile '{self.settings.execution_profile}' blocks shell actions",
             }
         if not self.settings.enable_shell:
             return {
-                "type": "noop",
+                "type": "invalid_action",
                 "reason": "shell disabled by ENABLE_SHELL=false",
             }
 
         command = args.get("command") or ""
         cwd = args.get("cwd")
         if not command:
-            return {"type": "noop", "reason": "shell command missing"}
+            return {"type": "invalid_action", "reason": "shell command missing"}
 
         return {
             "type": "sandbox_shell",
@@ -1436,12 +1779,12 @@ class CognitiveCore:
     def _map_script_args(self, args: Dict[str, Any]) -> Dict[str, Any]:
         if not self.settings.allows_shell_actions():
             return {
-                "type": "noop",
+                "type": "invalid_action",
                 "reason": f"execution profile '{self.settings.execution_profile}' blocks script actions",
             }
         if not self.settings.enable_shell:
             return {
-                "type": "noop",
+                "type": "invalid_action",
                 "reason": "script disabled by ENABLE_SHELL=false",
             }
 
@@ -1450,9 +1793,9 @@ class CognitiveCore:
         cwd = args.get("cwd")
 
         if operation not in {"write", "read", "run"}:
-            return {"type": "noop", "reason": f"unknown script action {operation or 'none'}"}
+            return {"type": "invalid_action", "reason": f"unknown script action {operation or 'none'}"}
         if not path:
-            return {"type": "noop", "reason": "script path missing"}
+            return {"type": "invalid_action", "reason": "script path missing"}
 
         payload: Dict[str, Any] = {
             "type": "script_op",
@@ -1479,7 +1822,7 @@ class CognitiveCore:
                 try:
                     payload["runtime_seconds"] = int(runtime_seconds)
                 except (TypeError, ValueError):
-                    return {"type": "noop", "reason": "script runtime_seconds must be an integer"}
+                    return {"type": "invalid_action", "reason": "script runtime_seconds must be an integer"}
             return payload
 
         return payload
@@ -1497,7 +1840,7 @@ class CognitiveCore:
     def _map_browser_args(self, args: Dict[str, Any]) -> Dict[str, Any]:
         if not self.settings.allows_browser_actions():
             return {
-                "type": "noop",
+                "type": "invalid_action",
                 "reason": f"execution profile '{self.settings.execution_profile}' blocks browser actions",
             }
 
@@ -1507,7 +1850,7 @@ class CognitiveCore:
             if cmd == "navigate":
                 url = (args.get("url") or "").strip()
                 if not url:
-                    return {"type": "capture_only", "reason": "browser.navigate missing url (Windows Cyborg mode)"}
+                    return {"type": "invalid_action", "reason": "browser.navigate missing url (Windows Cyborg mode)"}
                 payload = {
                     "type": "macro_actions",
                     "actions": [

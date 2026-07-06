@@ -43,7 +43,7 @@ def test_shell_tool_visible_when_enable_shell_true() -> None:
     assert "notebook" in names
 
 
-def test_map_shell_args_returns_noop_when_shell_disabled() -> None:
+def test_map_shell_args_returns_invalid_action_when_shell_disabled() -> None:
     core = CognitiveCore(
         Settings(use_openrouter=False, execution_profile="remote_cli", enable_shell=False),
         _DummyComputer(),
@@ -51,7 +51,7 @@ def test_map_shell_args_returns_noop_when_shell_disabled() -> None:
 
     result = core._map_shell_args({"command": "echo hello"})
 
-    assert result["type"] == "noop"
+    assert result["type"] == "invalid_action"
     assert "ENABLE_SHELL=false" in result["reason"]
 
 
@@ -78,7 +78,7 @@ def test_map_script_args_builds_script_op_payload() -> None:
     assert result["execution"] == "shell"
 
 
-def test_map_script_args_returns_noop_when_shell_disabled() -> None:
+def test_map_script_args_returns_invalid_action_when_shell_disabled() -> None:
     core = CognitiveCore(
         Settings(use_openrouter=False, execution_profile="remote_cli", enable_shell=False),
         _DummyComputer(),
@@ -86,5 +86,5 @@ def test_map_script_args_returns_noop_when_shell_disabled() -> None:
 
     result = core._map_script_args({"action": "read", "path": "tools/task.py"})
 
-    assert result["type"] == "noop"
+    assert result["type"] == "invalid_action"
     assert "ENABLE_SHELL=false" in result["reason"]

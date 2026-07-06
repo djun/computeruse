@@ -38,5 +38,15 @@ class RecoveryManager:
         if repeat_without_change >= int(getattr(self.settings, "max_same_target_failures", 2)):
             return RecoveryDecision(replan=bool(current_step), refresh_grounding=True, reason="no progress")
         if state.failure_count >= int(getattr(self.settings, "max_recovery_attempts_per_step", 3)):
-            return RecoveryDecision(replan=bool(current_step), reason="recovery budget reached")
+            # With a plan step a replan may still unblock; without one there is
+            # nothing left to revise, so escalate to the human for guidance.
+            return RecoveryDecision(
+                replan=bool(current_step),
+                request_user_input=not bool(current_step),
+                user_prompt=(
+                    "The agent exhausted its recovery attempts and keeps failing. "
+                    "Any guidance on how to proceed?"
+                ),
+                reason="recovery budget reached",
+            )
         return RecoveryDecision(reason=reason or "continue")

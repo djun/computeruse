@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 import time
 import re
 from typing import Any, Dict, List, Optional
@@ -143,6 +144,16 @@ class Orchestrator:
         force_vision_next_turn = True
         recovery_pending_replan = False
         low_conf_refresh_streak = 0
+        # noop ("no safe action now") and invalid_action (mapping/schema error)
+        # keep the loop alive with feedback instead of ending the task; this
+        # bounds how many turns in a row may stall without a real action.
+        consecutive_stall_turns = 0
+        MAX_CONSECUTIVE_STALL_TURNS = 3
+        # `done` with an incomplete plan step and no evidence is challenged once
+        # per step; a second insistence on the same step is accepted so the
+        # challenge can never loop. Tracked by step id so a premature `done` on a
+        # later, different incomplete step is still challenged.
+        done_challenged_step_id: Any = None
 
         try:
             while not state.should_halt():
@@ -216,11 +227,16 @@ class Orchestrator:
                 loop_state = self._format_loop_state(plan, state, repeat_same_action, repeat_without_change)
                 loop_state["visual_context"] = "image" if include_visual_context else "text_only"
                 
-                # Retrieve relevant skills
+                # Retrieve relevant skills; prompt inclusion is gated by score so
+                # weak matches do not spend context every turn.
                 relevant_skills = []
                 query_text = (current_step.description if current_step else "") or user_prompt or ""
                 if query_text:
-                    relevant_skills = self.memory.search_skills(query_text)
+                    relevant_skills = [
+                        match.skill
+                        for match in self.memory.search_skills_scored(query_text)
+                        if match.score >= self._skill_prompt_threshold(match.strategy)
+                    ][:3]
 
                 envelope = self.cognitive_core.propose_react_action(
                     overlay_frame,
@@ -242,15 +258,142 @@ class Orchestrator:
                 if cognitive_trace:
                     self.dashboard.push_thought(cognitive_trace)
 
-                if action.get("type") == "noop":
-                    self.logger.info("Noop action requested; stopping loop. Reason: %s", action.get("reason"))
+                if action.get("type") == "done":
+                    reason = str(action.get("reason") or "task completed")
+                    evidence = str(action.get("evidence") or "")
+                    if (
+                        current_step is not None
+                        and not evidence
+                        and done_challenged_step_id != current_step.id
+                    ):
+                        done_challenged_step_id = current_step.id
+                        state.history.append(
+                            f"done_challenged:step_{current_step.id}_incomplete_without_evidence"
+                        )
+                        repeat_info_for_model = {
+                            "count": repeat_same_action,
+                            "action": repr(action),
+                            "hint": (
+                                f"You declared done, but plan step {current_step.id} "
+                                f"('{current_step.description}') is not complete and no evidence was given. "
+                                "Either finish the step, or call done again with concrete `evidence` "
+                                "(visible text, final state) that the task is complete."
+                            ),
+                        }
+                        self.dashboard.push_event("done challenged: plan step incomplete, no evidence")
+                        self.logger.info(
+                            "Done challenged: step %s incomplete and no evidence provided.", current_step.id
+                        )
+                        continue
+                    self.logger.info("Done action received; stopping loop. Reason: %s", reason)
+                    state.history.append(
+                        f"task_done:{reason}" + (f":evidence={evidence[:300]}" if evidence else "")
+                    )
+                    self.dashboard.push_event(f"task_done:{reason}")
                     break
-                
+
+                # Information HITL: the model needs a human answer (login, captcha,
+                # ambiguity) — distinct from approval HITL handled by the engine.
+                if action.get("type") == "ask_user":
+                    question = str(action.get("question") or "").strip()
+                    ask_kind = str(action.get("kind") or "other")
+                    answer = self._request_user_input(question, ask_kind)
+                    if answer:
+                        consecutive_stall_turns = 0
+                        state.history.append(f"user_answer:{ask_kind}:{answer[:400]}")
+                        self.dashboard.push_event(f"user answered ({ask_kind})")
+                        repeat_info_for_model = {
+                            "count": 0,
+                            "action": repr(action),
+                            "hint": f"User answered your question ('{question[:120]}'): {answer[:400]}",
+                        }
+                        # The user may have acted on the screen (login, captcha,
+                        # permission dialog); re-observe before the next action.
+                        force_vision_next_turn = True
+                    else:
+                        consecutive_stall_turns += 1
+                        state.history.append(f"user_input_unavailable:{ask_kind}:{question[:200]}")
+                        self.dashboard.push_event("ask_user: no interactive user available")
+                        repeat_info_for_model = {
+                            "count": 0,
+                            "action": repr(action),
+                            "hint": (
+                                "No interactive user is available to answer. Continue autonomously "
+                                "if safe, or finish with done explaining the blocker."
+                            ),
+                        }
+                        if consecutive_stall_turns >= MAX_CONSECUTIVE_STALL_TURNS:
+                            self.logger.warning("Unanswerable ask_user repeated; stopping loop.")
+                            state.history.append("stalled:ask_user_without_interactive_user")
+                            self.dashboard.push_event("stalled: repeated ask_user without a user; stopping")
+                            break
+                    continue
+
+                if action.get("type") in {"noop", "invalid_action"}:
+                    reason = str(action.get("reason") or "")
+                    consecutive_stall_turns += 1
+                    if action.get("type") == "invalid_action":
+                        state.record_action(
+                            action,
+                            ActionResult(
+                                success=False,
+                                reason=reason or "invalid action",
+                                code="invalid_action",
+                                category="schema",
+                                retryable=True,
+                            ),
+                        )
+                        repeat_info_for_model = {
+                            "count": repeat_same_action,
+                            "action": repr(action),
+                            "hint": (
+                                f"Previous tool call was invalid: {reason}. "
+                                "Fix the arguments or choose a different action; the task is still in progress."
+                            ),
+                        }
+                        self.dashboard.push_event(f"invalid_action:{reason}")
+                        self.logger.warning("Invalid action from model; feeding back. Reason: %s", reason)
+                    else:
+                        state.history.append(f"noop:{reason}")
+                        self.dashboard.push_event(f"noop:{reason}")
+                        self.logger.info("Noop action; continuing loop. Reason: %s", reason)
+                    if consecutive_stall_turns >= MAX_CONSECUTIVE_STALL_TURNS:
+                        self.logger.warning(
+                            "%s consecutive stall turns (noop/invalid_action); stopping loop.",
+                            consecutive_stall_turns,
+                        )
+                        state.history.append(f"stalled:{consecutive_stall_turns}_consecutive_noop_or_invalid")
+                        self.dashboard.push_event("stalled: too many consecutive noop/invalid actions; stopping")
+                        break
+                    continue
+                consecutive_stall_turns = 0
+
+                # Model-requested observation (screenshot/capture_only): end the
+                # turn and guarantee the next prompt carries fresh visual context.
+                # Without this the sensor-`none` verification path would leave
+                # force_vision_next_turn=False and the requested screenshot would
+                # never reach the model.
+                if action.get("type") == "capture_only":
+                    result = self.computer.execute(action)
+                    state.record_action(action, result)
+                    reason = str(action.get("reason") or "model requested screenshot")
+                    state.history.append(f"screenshot_requested:{reason}")
+                    self.dashboard.push_event("screenshot requested; forcing visual context next turn")
+                    force_vision_next_turn = True
+                    continue
+
                 if action.get("type") == "run_skill":
                     skill_ref = action.get("skill_id") or action.get("skill_name")
                     skill = self.memory.get_skill(skill_ref) if skill_ref else None
                     if not skill:
-                        result = ActionResult(success=False, reason="skill not found")
+                        result = ActionResult(
+                            success=False,
+                            reason="skill not found",
+                            code="skill_not_found",
+                            category="execution",
+                            retryable=False,
+                            suggested_next=["use a skill ID from the listed skills", "perform the steps manually"],
+                        )
                         state.record_action(action, result)
                         repeat_info_for_model = {
                             "count": repeat_same_action,
@@ -268,6 +411,9 @@ class Orchestrator:
                         result = ActionResult(
                             success=False,
                             reason="missing required skill args: " + ", ".join(sorted(missing_params)),
+                            code="skill_args_missing",
+                            category="schema",
+                            retryable=True,
                         )
                         state.record_action(action, result)
                         repeat_info_for_model = {
@@ -351,7 +497,14 @@ class Orchestrator:
                 # Resolve overlay element references to coordinates
                 resolved_ok = self._resolve_element_references(action, current_tags)
                 if not resolved_ok:
-                    result = ActionResult(success=False, reason="element_id not found")
+                    result = ActionResult(
+                        success=False,
+                        reason="element_id not found",
+                        code="target_not_found",
+                        category="grounding",
+                        retryable=True,
+                        suggested_next=["observe:fused", "observe:zoom", "probe_ui"],
+                    )
                     state.record_action(action, result)
                     repeat_info_for_model = {"count": repeat_same_action, "action": repr(action), "hint": "element_id not found; request new inspect_ui. Grounding refreshed."}
                     self.dashboard.push_event("element_id resolution failed; forcing grounding refresh")
@@ -408,7 +561,14 @@ class Orchestrator:
                     count = hotkey_counts.get(combo, 0)
                     if count >= 2:
                         self.logger.info("Skipping hotkey %s; already executed %s times", "+".join(combo), count)
-                        result = ActionResult(success=False, reason="hotkey deduped")
+                        result = ActionResult(
+                            success=False,
+                            reason="hotkey deduped",
+                            code="hotkey_deduped",
+                            category="execution",
+                            retryable=False,
+                            suggested_next=["click the visible control instead", "observe:screenshot"],
+                        )
                         state.record_action(action, result)
                         repeat_info_for_model = {"count": repeat_same_action, "action": repr(action)}
                         continue
@@ -419,7 +579,14 @@ class Orchestrator:
                     count = hotkey_counts.get(app_key, 0)
                     if count >= 1:  # Strict limit: don't open the same app twice in a short loop
                          self.logger.info("Skipping open_app %s; already executed", app_key[1])
-                         result = ActionResult(success=False, reason="app open deduped")
+                         result = ActionResult(
+                             success=False,
+                             reason="app open deduped",
+                             code="app_open_deduped",
+                             category="execution",
+                             retryable=False,
+                             suggested_next=["focus the already-open window", "observe:screenshot"],
+                         )
                          state.record_action(action, result)
                          repeat_info_for_model = {"count": repeat_same_action, "action": repr(action)}
                          continue
@@ -463,6 +630,15 @@ class Orchestrator:
                 verification_reason = str(verification_outcome.get("reason") or "")
                 force_vision_next_turn = bool(verification_outcome.get("force_vision_next_turn", True))
 
+                # Macros truncated at an observation/done sub-action: surface the
+                # truncation to the model, and when the cut was an observation,
+                # guarantee fresh visual context next turn regardless of the
+                # verification sensor used for the executable prefix.
+                if action.get("type") == "macro_actions" and action.get("truncation_note"):
+                    state.history.append(f"macro_truncated:{action.get('truncation_note')}")
+                    if action.get("observe_after"):
+                        force_vision_next_turn = True
+
                 state.record_observation(
                     next_frame, changed, phash=next_hash, hash_distance=hash_distance, note=obs_note
                 )
@@ -489,6 +665,21 @@ class Orchestrator:
                     force_vision_next_turn = True
                 if recovery_decision.replan:
                     recovery_pending_replan = True
+                if recovery_decision.request_user_input:
+                    guidance = self._request_user_input(
+                        recovery_decision.user_prompt
+                        or "The agent is stuck and needs guidance. How should it proceed?",
+                        "recovery",
+                    )
+                    if guidance:
+                        state.history.append(f"user_guidance:{guidance[:400]}")
+                        self.dashboard.push_event("user provided recovery guidance")
+                        repeat_info_for_model = {
+                            "count": 0,
+                            "action": repr(action),
+                            "hint": f"User guidance: {guidance[:400]}",
+                        }
+                        force_vision_next_turn = True
                 # Strip heavy payloads (base64 frame, full a11y subtree) from the
                 # turn record. The turn is copied into the event log and fed back
                 # through compact_view into the next prompt; keeping image/tree data
@@ -1073,7 +1264,7 @@ class Orchestrator:
 
     def _append_step_trace(self, step_trace: List[Dict[str, Any]], action: dict, result: ActionResult, changed: bool) -> None:
         action_type = action.get("type")
-        if action_type in {"notebook_op", "inspect_ui", "probe_ui", "capture_only", "noop"}:
+        if action_type in {"notebook_op", "inspect_ui", "probe_ui", "capture_only", "noop", "done", "invalid_action", "ask_user"}:
             return
         record: Dict[str, Any] = {
             "success": bool(result.success),
@@ -1464,19 +1655,81 @@ class Orchestrator:
             self.logger.warning("Failed to persist episode: %s", exc)
 
     def _compress_history(self, state: StateManager) -> None:
-        """Summarize the oldest part of the history to keep the context manageable."""
+        """Compact the oldest part of the history to keep the context manageable.
+
+        Deterministic (no LLM call): history lines are structured, so counting
+        and keeping notable events summarizes them for free instead of paying
+        tokens now to save tokens later.
+        """
         # Keep index 0 (usually plan_init or user_prompt)
-        # Summarize index 1 to 20
+        # Compact index 1 to 20
         # Keep rest
         if len(state.history) < 60:
             return
-        
+
         chunk_to_summarize = state.history[1:21]
-        summary = self.planner.summarize_history_chunk(chunk_to_summarize)
+        summary = self._compact_history_chunk(chunk_to_summarize)
         if summary:
             self.logger.info("Compressing history: %s items -> 1 summary", len(chunk_to_summarize))
             new_history = [state.history[0]] + [f"history_summary:{summary}"] + state.history[21:]
             state.history = new_history
+
+    @staticmethod
+    def _compact_history_chunk(chunk: List[str]) -> str:
+        """Deterministic one-line summary of structured history lines."""
+        action_counts: Dict[str, int] = {}
+        action_failures = 0
+        verification_failures = 0
+        observations = 0
+        notable: List[str] = []
+        for line in chunk:
+            if line.startswith("action:"):
+                match = re.search(r"'type': '([^']+)'", line)
+                action_type = match.group(1) if match else "unknown"
+                action_counts[action_type] = action_counts.get(action_type, 0) + 1
+                if "'success': False" in line:
+                    action_failures += 1
+            elif line.startswith(("verification_contract_failed", "verification_failure")):
+                verification_failures += 1
+            elif line.startswith("observation@"):
+                observations += 1
+            elif line.startswith(
+                (
+                    "stuck:",
+                    "plan_revised",
+                    "plan_step_completed",
+                    "plan_step_failed",
+                    "reflector_fail",
+                    "user_answer",
+                    "user_guidance",
+                    "macro_truncated",
+                    "done_challenged",
+                )
+            ):
+                notable.append(line[:100])
+
+        parts: List[str] = []
+        if action_counts:
+            rendered = ", ".join(
+                f"{name}x{count}"
+                for name, count in sorted(action_counts.items(), key=lambda kv: -kv[1])[:6]
+            )
+            failures_note = f", {action_failures} failed" if action_failures else ""
+            parts.append(f"{sum(action_counts.values())} actions ({rendered}{failures_note})")
+        if observations:
+            parts.append(f"{observations} observations")
+        if verification_failures:
+            parts.append(f"{verification_failures} verification failures")
+        if notable:
+            parts.append("notable: " + " | ".join(notable[-4:]))
+        return "; ".join(parts) or f"{len(chunk)} events"
+
+    def _skill_prompt_threshold(self, strategy: str) -> float:
+        """Prompt inclusion is advisory (the model still decides), so gate at a
+        softer bar (0.75x) than the autonomous fast-path execution thresholds."""
+        if strategy == "keyword":
+            return float(self.settings.fast_path_min_keyword_score) * 0.75
+        return float(self.settings.fast_path_min_vector_score) * 0.75
 
     def _resolve_element_references(self, action: dict, tags: List[Dict[str, Any]]) -> bool:
         """Translate element_id/target_gid to x/y (physical px) using the most recent overlay tags."""
@@ -1644,6 +1897,25 @@ class Orchestrator:
 
     def _normalize_reference_token(self, value: str) -> str:
         return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+    def _request_user_input(self, question: str, kind: str = "other") -> str | None:
+        """Ask the human for information mid-task (not an approval prompt).
+
+        Returns None when no interactive channel exists (HITL disabled or no
+        TTY) so callers can degrade to autonomous behavior.
+        """
+        if not self.settings.enable_hitl_prompt:
+            return None
+        stdin = getattr(sys, "stdin", None)
+        if not stdin or not hasattr(stdin, "isatty") or not stdin.isatty():
+            self.logger.warning("ask_user requested but no interactive stdin is available.")
+            return None
+        try:
+            print(f"\n[AGENT QUESTION - {kind}] {question}")
+            answer = input("> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return None
+        return answer or None
 
     def _refresh_grounding(self, state: StateManager) -> tuple[str, str, List[Dict[str, Any]], dict | None]:
         """

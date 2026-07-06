@@ -84,12 +84,24 @@ class SharedActionEngine(ABC):
         action = self._enrich_action(action)
         allowed, deny_reason = self._is_allowed_by_execution_profile(action)
         if not allowed:
-            return ActionResult(success=False, reason=deny_reason)
+            return ActionResult(
+                success=False,
+                reason=deny_reason,
+                code="profile_blocked",
+                category="capability",
+                retryable=False,
+            )
 
         decision = self.policy_engine.evaluate(action)
         if not decision.allowed:
             self.logger.warning("Action blocked by policy: %s", decision.reason)
-            return ActionResult(success=False, reason=decision.reason)
+            return ActionResult(
+                success=False,
+                reason=decision.reason,
+                code="policy_blocked",
+                category="policy",
+                retryable=False,
+            )
 
         hitl_reason = ""
         if decision.hitl_required:
@@ -103,11 +115,26 @@ class SharedActionEngine(ABC):
             self.logger.warning("Action requires human confirmation: %s", action)
             approved, deny_reason = self._request_hitl_approval(action, hitl_reason)
             if not approved:
-                return ActionResult(success=False, reason=deny_reason)
+                return ActionResult(
+                    success=False,
+                    reason=deny_reason,
+                    code="hitl_denied",
+                    category="policy",
+                    retryable=False,
+                    suggested_next=["choose a lower-risk approach", "ask_user for guidance"],
+                )
 
         # Special-cased actions for loop control.
-        if action.get("type") in ("noop", "capture_only"):
+        if action.get("type") in ("noop", "capture_only", "done", "ask_user"):
             return ActionResult(success=True, reason=action.get("reason", "noop"))
+        if action.get("type") == "invalid_action":
+            return ActionResult(
+                success=False,
+                reason=action.get("reason", "invalid action"),
+                code="invalid_action",
+                category="schema",
+                retryable=True,
+            )
         if action.get("type") == "wait":
             seconds = float(action.get("seconds", 1))
             time.sleep(seconds)
@@ -177,7 +204,7 @@ class SharedActionEngine(ABC):
         action_type = str(action.get("type") or "")
 
         if profile == "remote_cli":
-            allowed_types = {"noop", "capture_only", "wait", "sandbox_shell", "script_op"}
+            allowed_types = {"noop", "capture_only", "done", "wait", "sandbox_shell", "script_op"}
             if action_type in allowed_types:
                 if action_type in {"sandbox_shell", "script_op"} and execution_path != "shell":
                     return False, (

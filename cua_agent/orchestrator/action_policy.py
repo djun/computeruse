@@ -35,6 +35,30 @@ class ActionPolicy:
         "hover",
         "type",
     }
+    # Risk lives in the target's meaning, not only in the action type: clicking
+    # "Delete account" is not the same as clicking "Search".
+    ACTIVATION_TYPES = {"left_click", "right_click", "double_click", "click_element", "click_and_type"}
+    TEXT_ENTRY_TYPES = {"type", "fill_field", "click_and_type"}
+    DESTRUCTIVE_LABEL_TOKENS = (
+        "delete",
+        "remove",
+        "erase",
+        "format",
+        "uninstall",
+        "wipe",
+        "destroy",
+        "shut down",
+        "shutdown",
+        "empty trash",
+        "factory reset",
+        "excluir",
+        "apagar",
+        "remover",
+        "formatar",
+        "desinstalar",
+        "esvaziar lixeira",
+    )
+    SECURE_FIELD_ROLE_TOKENS = ("securetextfield", "passwordbox", "password")
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -55,13 +79,18 @@ class ActionPolicy:
             normalized.setdefault("target_gid", target_gid)
             normalized.setdefault("grounding_confidence", target_confidence)
 
+        sensitive_reason = self._sensitive_target_reason(normalized, grounding)
+        if sensitive_reason and self._RISK_ORDER.get(risk_level, 0) < self._RISK_ORDER["high"]:
+            risk_level = "high"
+
+        risk_detail = f"{risk_level}-risk action" + (f" ({sensitive_reason})" if sensitive_reason else "")
         block, hitl_required = self._autonomy_gate(risk_level)
         if block:
             return ActionPolicyDecision(
                 allowed=False,
                 action=normalized,
                 risk_level=risk_level,
-                reason=f"autonomy policy requires confirmation for {risk_level}-risk action",
+                reason=f"autonomy policy requires confirmation for {risk_detail}",
                 target_gid=target_gid,
                 target_confidence=target_confidence,
             )
@@ -71,7 +100,7 @@ class ActionPolicy:
             # open_app/focus_window/browser_op/macro_actions. Flag the action so the
             # platform action engine routes it through the interactive confirmation.
             normalized["requires_hitl_confirmation"] = True
-            normalized["hitl_reason"] = f"autonomy policy: {risk_level}-risk action needs confirmation"
+            normalized["hitl_reason"] = f"autonomy policy: {risk_detail} needs confirmation"
 
         # Low-confidence target detection covers the top-level action and, for
         # macro wrappers, each targeted subaction (which the orchestrator resolves
@@ -108,6 +137,10 @@ class ActionPolicy:
                 "target_gid": decision.target_gid,
                 "target_confidence": decision.target_confidence,
             },
+            code="policy_blocked",
+            category="policy",
+            retryable=False,
+            suggested_next=["choose a lower-risk action", "ask_user for confirmation"],
         )
 
     def should_force_visual(self, state: StateManager, turn_index: int) -> bool:
@@ -169,6 +202,49 @@ class ActionPolicy:
         if bool(self.settings.enable_hitl_prompt):
             return False, True
         return True, False
+
+    def _sensitive_target_reason(self, action: dict[str, Any], grounding: GroundingBundle | None) -> str:
+        """Escalation reason when the resolved target is destructive or sensitive."""
+        action_type = str(action.get("type") or "").strip().lower()
+        if action_type == "macro_actions":
+            for sub in action.get("actions") or []:
+                if isinstance(sub, dict):
+                    reason = self._sensitive_target_reason(sub, grounding)
+                    if reason:
+                        return reason
+            return ""
+        if action_type not in self.TARGETED_TYPES:
+            return ""
+
+        label, role = self._target_label_role(action, grounding)
+        if action_type in self.TEXT_ENTRY_TYPES and role:
+            role_l = role.lower()
+            if any(token in role_l for token in self.SECURE_FIELD_ROLE_TOKENS):
+                return f"text entry into secure field (role={role})"
+        if action_type in self.ACTIVATION_TYPES and label:
+            label_l = label.lower()
+            for token in self.DESTRUCTIVE_LABEL_TOKENS:
+                if token in label_l:
+                    return f"destructive target label '{label}'"
+        return ""
+
+    def _target_label_role(self, action: dict[str, Any], grounding: GroundingBundle | None) -> tuple[str, str]:
+        label = str(action.get("semantic_label") or "")
+        role = str(action.get("semantic_role") or "")
+        if label or role:
+            return label, role
+        ref = action.get("element_id") if action.get("element_id") is not None else action.get("element_ref")
+        token = str(ref).strip() if ref is not None else ""
+        if not token:
+            return "", ""
+        for tag in (grounding.som_tags if grounding else None) or []:
+            if token in {str(tag.get("id")), str(tag.get("gid"))}:
+                return str(tag.get("label") or ""), str(tag.get("role") or "")
+        # A non-numeric ref is itself the human-readable label the model targeted
+        # (clean-API target.label), even when no overlay tag matches it.
+        if not token.isdigit():
+            return token, ""
+        return "", ""
 
     def _annotate_target(
         self, action: dict[str, Any], grounding: GroundingBundle | None

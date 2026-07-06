@@ -40,7 +40,17 @@ ComputerActionName = Literal[
     "focus_window",
     "screenshot",
     "zoom",
+    "observe",
     "run_skill",
+    "done",
+    "ask_user",
+    # Clean-API aliases (mapped internally onto the legacy types above).
+    "click",
+    "input_text",
+    "press_keys",
+    "drag",
+    "focus",
+    "clipboard",
 ]
 
 
@@ -71,5 +81,41 @@ COMPUTER_ACTION_SPACE: tuple[ComputerActionName, ...] = (
     "focus_window",
     "screenshot",
     "zoom",
+    "observe",
     "run_skill",
+    "done",
+    "ask_user",
+    "click",
+    "input_text",
+    "press_keys",
+    "drag",
+    "focus",
+    "clipboard",
 )
+
+
+@dataclass(frozen=True)
+class Capability:
+    """Availability of one runtime capability for the current OS/profile/flags.
+
+    mode: real (works), dry_run (accepted but no real input is sent),
+    degraded (works partially/unreliably), blocked (will fail; do not attempt).
+    """
+
+    name: str
+    available: bool
+    mode: str  # real | dry_run | degraded | blocked
+    reason: str = ""
+
+
+# Internal action types that observe state instead of mutating it. They end the
+# reasoning turn: fresh context must reach the model before any further action,
+# so they may not be mixed with executable sub-actions inside a macro.
+OBSERVATION_ACTION_TYPES: frozenset[str] = frozenset(
+    {"capture_only", "zoom", "inspect_ui", "probe_ui"}
+)
+
+# Loop-control action types resolved by the orchestrator without touching the
+# computer: `done` ends the task, `noop` skips the turn, `invalid_action`
+# feeds a mapping error back to the model, `ask_user` requests human input.
+LOOP_CONTROL_ACTION_TYPES: frozenset[str] = frozenset({"done", "noop", "invalid_action", "ask_user"})

@@ -67,7 +67,7 @@ def replay_trajectory(
     outcomes: list[dict[str, Any]] = []
     for idx, record in enumerate(records):
         action = record.get("action") or {}
-        if not action or action.get("type") in {"noop", "capture_only"}:
+        if not action or action.get("type") in {"noop", "capture_only", "done", "invalid_action", "ask_user"}:
             outcomes.append({"turn": idx, "skipped": True, "action": action})
             continue
         result = computer.execute(action)
